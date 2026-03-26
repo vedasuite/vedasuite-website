@@ -1,0 +1,43 @@
+<svg width="1600" height="1200" viewBox="0 0 1600 1200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7F1E7"/>
+      <stop offset="1" stop-color="#E7DDCC"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="618" y1="188" x2="1452" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1D243D"/>
+      <stop offset="0.5" stop-color="#28324E"/>
+      <stop offset="1" stop-color="#453245"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="1200" rx="48" fill="url(#bg)"/>
+  <rect x="48" y="48" width="1504" height="88" rx="28" fill="#151515"/>
+  <text x="112" y="100" fill="#F7F1E7" font-family="Georgia, serif" font-size="30" font-weight="700">VedaSuite AI</text>
+  <rect x="312" y="156" width="1240" height="820" rx="36" fill="#FAF6EF"/>
+  <rect x="312" y="156" width="272" height="820" rx="36" fill="#F3ECE0"/>
+  <text x="356" y="232" fill="#1E1E1E" font-family="Georgia, serif" font-size="48" font-weight="700">Settings</text>
+  <text x="358" y="282" fill="#756B5E" font-family="Arial, sans-serif" font-size="22">Tune risk posture, competitor coverage, and AI operating preferences.</text>
+  <rect x="620" y="196" width="872" height="154" rx="32" fill="url(#hero)"/>
+  <text x="660" y="252" fill="#FFF6E6" font-family="Georgia, serif" font-size="52" font-weight="700">Merchant operating controls</text>
+  <text x="660" y="302" fill="#E6DFC8" font-family="Arial, sans-serif" font-size="24">Apply presets, track readiness, and tune AI bias without leaving Shopify Admin.</text>
+  <rect x="660" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="928" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="1196" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <text x="690" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Plan</text>
+  <text x="690" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">PRO</text>
+  <text x="958" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Pricing bias</text>
+  <text x="958" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">78</text>
+  <text x="1226" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Profit guardrail</text>
+  <text x="1226" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">26%</text>
+  <rect x="660" y="552" width="786" height="340" rx="28" fill="#FFFFFF"/>
+  <text x="694" y="604" fill="#181818" font-family="Georgia, serif" font-size="34" font-weight="700">Preset control center</text>
+  <text x="694" y="674" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">Risk operations preset</text>
+  <text x="694" y="730" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">Balanced growth preset</text>
+  <text x="694" y="786" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">Margin protection preset</text>
+  <rect x="1102" y="650" width="240" height="44" rx="22" fill="#D3F2D7"/>
+  <rect x="1102" y="706" width="240" height="44" rx="22" fill="#D3F2D7"/>
+  <rect x="1102" y="762" width="240" height="44" rx="22" fill="#D3F2D7"/>
+  <text x="1172" y="678" fill="#21572A" font-family="Arial, sans-serif" font-size="20" font-weight="700">Apply preset</text>
+  <text x="1172" y="734" fill="#21572A" font-family="Arial, sans-serif" font-size="20" font-weight="700">Apply preset</text>
+  <text x="1172" y="790" fill="#21572A" font-family="Arial, sans-serif" font-size="20" font-weight="700">Apply preset</text>
+</svg>

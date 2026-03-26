@@ -1,0 +1,76 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="144" y1="112" x2="908" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#080C1A"/>
+      <stop offset="0.52" stop-color="#111B34"/>
+      <stop offset="1" stop-color="#1B1427"/>
+    </linearGradient>
+    <radialGradient id="glowGold" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(308 282) rotate(42.3718) scale(312.292 286.477)">
+      <stop stop-color="#F3D291"/>
+      <stop offset="1" stop-color="#F3D291" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowMagenta" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(752 290) rotate(137.365) scale(318.341 303.441)">
+      <stop stop-color="#B762B7"/>
+      <stop offset="1" stop-color="#B762B7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="petalTop" x1="510" y1="185" x2="510" y2="418" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5B8E6"/>
+      <stop offset="1" stop-color="#70348B"/>
+    </linearGradient>
+    <linearGradient id="petalLeft" x1="224" y1="430" x2="427" y2="612" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE39A"/>
+      <stop offset="1" stop-color="#B98C39"/>
+    </linearGradient>
+    <linearGradient id="petalLeftSmall" x1="170" y1="512" x2="336" y2="661" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD370"/>
+      <stop offset="1" stop-color="#BC8732"/>
+    </linearGradient>
+    <linearGradient id="petalRight" x1="615" y1="430" x2="820" y2="614" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E5F174"/>
+      <stop offset="1" stop-color="#6C992A"/>
+    </linearGradient>
+    <linearGradient id="petalRightSmall" x1="680" y1="500" x2="847" y2="653" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D7F161"/>
+      <stop offset="1" stop-color="#6F9A2C"/>
+    </linearGradient>
+    <linearGradient id="core" x1="388" y1="318" x2="676" y2="703" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2A134A"/>
+      <stop offset="1" stop-color="#071522"/>
+    </linearGradient>
+    <linearGradient id="circuit" x1="414" y1="334" x2="648" y2="643" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D5B4FF"/>
+      <stop offset="1" stop-color="#57ADFF"/>
+    </linearGradient>
+    <filter id="softShadow" x="123" y="150" width="774" height="673" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="26"/>
+      <feGaussianBlur stdDeviation="34"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.0352941 0 0 0 0 0.054902 0 0 0 0 0.113725 0 0 0 0.42 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <circle cx="319" cy="285" r="270" fill="url(#glowGold)"/>
+  <circle cx="742" cy="304" r="272" fill="url(#glowMagenta)"/>
+  <g filter="url(#softShadow)">
+    <path d="M512 186C581 240 630 315 653 406C596 369 547 352 512 352C477 352 428 369 371 406C394 315 443 240 512 186Z" fill="url(#petalTop)"/>
+    <path d="M228 414C333 414 408 443 473 520C367 534 292 520 228 465C210 450 206 426 228 414Z" fill="url(#petalLeft)"/>
+    <path d="M158 541C242 529 310 552 380 614C286 637 217 625 158 580C135 561 139 545 158 541Z" fill="url(#petalLeftSmall)"/>
+    <path d="M796 414C691 414 616 443 551 520C657 534 732 520 796 465C814 450 818 426 796 414Z" fill="url(#petalRight)"/>
+    <path d="M866 541C782 529 714 552 644 614C738 637 807 625 866 580C889 561 885 545 866 541Z" fill="url(#petalRightSmall)"/>
+    <path d="M521 309C627 309 702 387 702 493C702 608 626 684 521 684C415 684 339 608 339 493C339 387 415 309 521 309Z" fill="url(#core)" stroke="#25134A" stroke-width="14"/>
+    <path d="M519 360V641M519 360C492 360 472 374 472 397V472M519 360C546 360 566 374 566 397V472M472 472L402 424M472 472L402 523M472 472V549M566 472L638 424M566 472L638 523M566 472V549M402 424L369 451M402 523L369 554M472 549L428 587M566 549L609 587M638 424L672 451M638 523L672 554" stroke="url(#circuit)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="369" cy="451" r="14" fill="#D2B3FF"/>
+    <circle cx="369" cy="554" r="14" fill="#D2B3FF"/>
+    <circle cx="428" cy="587" r="14" fill="#D2B3FF"/>
+    <circle cx="609" cy="587" r="14" fill="#65AAFF"/>
+    <circle cx="672" cy="451" r="14" fill="#65AAFF"/>
+    <circle cx="672" cy="554" r="14" fill="#65AAFF"/>
+    <circle cx="472" cy="397" r="16" fill="#D8BCFF"/>
+    <circle cx="566" cy="397" r="16" fill="#8BC2FF"/>
+    <path d="M288 724C360 705 436 696 512 696C588 696 664 705 736 724" stroke="#8E7C42" stroke-width="18" stroke-linecap="round"/>
+  </g>
+</svg>

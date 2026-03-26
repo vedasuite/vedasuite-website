@@ -1,0 +1,38 @@
+<svg width="1600" height="1200" viewBox="0 0 1600 1200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7F1E7"/>
+      <stop offset="1" stop-color="#E8DECC"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="620" y1="186" x2="1454" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B273F"/>
+      <stop offset="0.52" stop-color="#263757"/>
+      <stop offset="1" stop-color="#433144"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="1200" rx="48" fill="url(#bg)"/>
+  <rect x="48" y="48" width="1504" height="88" rx="28" fill="#151515"/>
+  <text x="112" y="100" fill="#F7F1E7" font-family="Georgia, serif" font-size="30" font-weight="700">VedaSuite AI</text>
+  <rect x="312" y="156" width="1240" height="820" rx="36" fill="#FAF6EF"/>
+  <rect x="312" y="156" width="272" height="820" rx="36" fill="#F3ECE0"/>
+  <text x="356" y="232" fill="#1E1E1E" font-family="Georgia, serif" font-size="48" font-weight="700">Reports</text>
+  <text x="358" y="282" fill="#756B5E" font-family="Arial, sans-serif" font-size="22">Executive-grade intelligence across fraud, market, pricing, and profit.</text>
+  <rect x="620" y="196" width="872" height="154" rx="32" fill="url(#hero)"/>
+  <text x="660" y="252" fill="#FFF6E6" font-family="Georgia, serif" font-size="52" font-weight="700">Weekly operating brief</text>
+  <text x="660" y="302" fill="#E6DFC8" font-family="Arial, sans-serif" font-size="24">Revenue, AOV, risk pressure, competitor movement, and recommended next actions in one report.</text>
+  <rect x="660" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="928" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="1196" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <text x="690" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Revenue</text>
+  <text x="690" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">$18.4k</text>
+  <text x="958" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">AOV</text>
+  <text x="958" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">$67</text>
+  <text x="1226" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Market pressure</text>
+  <text x="1226" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">Medium</text>
+  <rect x="660" y="552" width="786" height="340" rx="28" fill="#FFFFFF"/>
+  <text x="694" y="604" fill="#181818" font-family="Georgia, serif" font-size="34" font-weight="700">Priority recommendations</text>
+  <text x="694" y="672" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">• Review high-risk queue before approving flagged orders.</text>
+  <text x="694" y="726" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">• Respond selectively to competitor promotions instead of broad discounting.</text>
+  <text x="694" y="780" fill="#5D544A" font-family="Arial, sans-serif" font-size="24">• Push highest-confidence pricing changes into next week’s margin plan.</text>
+  <text x="694" y="852" fill="#21572A" font-family="Arial, sans-serif" font-size="24" font-weight="700">Confidence 91%</text>
+</svg>

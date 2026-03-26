@@ -1,0 +1,51 @@
+<svg width="1600" height="1200" viewBox="0 0 1600 1200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7F1E7"/>
+      <stop offset="1" stop-color="#EAE0CE"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="618" y1="188" x2="1452" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14233E"/>
+      <stop offset="0.5" stop-color="#1D3556"/>
+      <stop offset="1" stop-color="#3B3346"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="1200" rx="48" fill="url(#bg)"/>
+  <rect x="48" y="48" width="1504" height="88" rx="28" fill="#151515"/>
+  <text x="112" y="100" fill="#F7F1E7" font-family="Georgia, serif" font-size="30" font-weight="700">VedaSuite AI</text>
+  <rect x="312" y="156" width="1240" height="820" rx="36" fill="#FAF6EF"/>
+  <rect x="312" y="156" width="272" height="820" rx="36" fill="#F3ECE0"/>
+  <text x="356" y="232" fill="#1E1E1E" font-family="Georgia, serif" font-size="48" font-weight="700">Competitor Intelligence</text>
+  <text x="358" y="282" fill="#756B5E" font-family="Arial, sans-serif" font-size="22">Market monitoring with website, shopping, and ad-signal coverage.</text>
+  <rect x="620" y="196" width="872" height="154" rx="32" fill="url(#hero)"/>
+  <text x="660" y="252" fill="#FFF6E6" font-family="Georgia, serif" font-size="52" font-weight="700">Monitor market pressure in real time</text>
+  <text x="660" y="302" fill="#E6DFC8" font-family="Arial, sans-serif" font-size="24">Track domains, price deltas, promotions, and signal freshness from one embedded screen.</text>
+  <rect x="660" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="928" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <rect x="1196" y="386" width="250" height="124" rx="24" fill="#FFFFFF"/>
+  <text x="690" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Signals / 24h</text>
+  <text x="690" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">26</text>
+  <text x="958" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Tracked domains</text>
+  <text x="958" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">4</text>
+  <text x="1226" y="430" fill="#43362F" font-family="Arial, sans-serif" font-size="20" font-weight="700">Freshness</text>
+  <text x="1226" y="486" fill="#161616" font-family="Georgia, serif" font-size="52" font-weight="700">2.4h</text>
+  <rect x="660" y="552" width="386" height="314" rx="28" fill="#FFFFFF"/>
+  <rect x="1060" y="552" width="386" height="314" rx="28" fill="#FFFFFF"/>
+  <text x="694" y="604" fill="#181818" font-family="Georgia, serif" font-size="34" font-weight="700">Connector coverage</text>
+  <text x="694" y="664" fill="#60564C" font-family="Arial, sans-serif" font-size="24">Website crawler</text>
+  <text x="694" y="716" fill="#60564C" font-family="Arial, sans-serif" font-size="24">Google Shopping feed</text>
+  <text x="694" y="768" fill="#60564C" font-family="Arial, sans-serif" font-size="24">Meta Ad Library</text>
+  <rect x="906" y="642" width="102" height="36" rx="18" fill="#D3F2D7"/>
+  <rect x="906" y="694" width="102" height="36" rx="18" fill="#D3F2D7"/>
+  <rect x="906" y="746" width="102" height="36" rx="18" fill="#D3F2D7"/>
+  <text x="936" y="666" fill="#21572A" font-family="Arial, sans-serif" font-size="18" font-weight="700">Healthy</text>
+  <text x="936" y="718" fill="#21572A" font-family="Arial, sans-serif" font-size="18" font-weight="700">Healthy</text>
+  <text x="936" y="770" fill="#21572A" font-family="Arial, sans-serif" font-size="18" font-weight="700">Healthy</text>
+  <text x="1094" y="604" fill="#181818" font-family="Georgia, serif" font-size="34" font-weight="700">Top movers</text>
+  <text x="1094" y="666" fill="#1C1C1C" font-family="Arial, sans-serif" font-size="24">Glow Tea Bundle</text>
+  <text x="1094" y="718" fill="#1C1C1C" font-family="Arial, sans-serif" font-size="24">Premium Herbal Set</text>
+  <text x="1094" y="770" fill="#1C1C1C" font-family="Arial, sans-serif" font-size="24">Daily Calm Drops</text>
+  <text x="1330" y="666" fill="#7A4E08" font-family="Arial, sans-serif" font-size="22" font-weight="700">-$2.50</text>
+  <text x="1330" y="718" fill="#21572A" font-family="Arial, sans-serif" font-size="22" font-weight="700">+$1.80</text>
+  <text x="1330" y="770" fill="#7A4E08" font-family="Arial, sans-serif" font-size="22" font-weight="700">-$1.10</text>
+</svg>
