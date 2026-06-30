@@ -133,7 +133,7 @@ export function TrustAbusePage() {
   const evidenceSectionRef = useRef<HTMLDivElement | null>(null);
   const allowed = isBackendModuleEnabled(appState, "fraud");
 
-  const loadOverview = useCallback(async () => {
+  const loadOverview = useCallback(async (showToast = false) => {
     if (!allowed) {
       setOverview(createEmptyOverview());
       setLoading(false);
@@ -145,9 +145,11 @@ export function TrustAbusePage() {
     try {
       const res = await embeddedShopRequest<{ overview: Overview }>("/api/trust-abuse/overview", { timeoutMs: 30000 });
       setOverview(res.overview);
+      if (showToast) setToast("Fraud intelligence refreshed.");
     } catch {
       setOverview(createEmptyOverview("FAILED", "VedaSuite could not load persisted trust and abuse outputs."));
       setSyncIssue(true);
+      if (showToast) setToast("Refresh failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -291,7 +293,7 @@ export function TrustAbusePage() {
     <Page
       title="Fraud Intelligence"
       subtitle="Review risky orders, customer behavior, and the policy actions VedaSuite recommends right now."
-      primaryAction={{ content: "Refresh", onAction: () => void loadOverview(), loading, disabled: loading }}
+      primaryAction={{ content: "Refresh", onAction: () => void loadOverview(true), loading, disabled: loading }}
     >
       <Layout>
         {loading ? (

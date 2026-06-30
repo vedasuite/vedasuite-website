@@ -16,7 +16,7 @@ import {
   TextField,
   Toast,
 } from "@shopify/polaris";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ModuleGate } from "../../components/ModuleGate";
 import { useAppState } from "../../hooks/useAppState";
@@ -343,6 +343,7 @@ export function CompetitorPage() {
   );
   const [selectedTab, setSelectedTab] = useState(0);
   const [modalOpen, setModalOpen] = useState(false);
+  const tabsSectionRef = useRef<HTMLDivElement | null>(null);
   const [ingesting, setIngesting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [domainsInput, setDomainsInput] = useState("");
@@ -509,10 +510,16 @@ export function CompetitorPage() {
     }
     if (primaryState === "CHANGES_DETECTED") {
       setSelectedTab(1);
+      window.setTimeout(() => {
+        tabsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 50);
       return;
     }
     if (primaryState === "LOW_CONFIDENCE") {
       setSelectedTab(0);
+      window.setTimeout(() => {
+        tabsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 50);
       return;
     }
     void ingestCompetitorData();
@@ -741,6 +748,7 @@ export function CompetitorPage() {
 
           {showOperationalPanels ? (
           <Layout.Section>
+            <div ref={tabsSectionRef}>
             <Card>
               <Tabs
                 tabs={[
@@ -964,6 +972,7 @@ export function CompetitorPage() {
                 </Box>
               </Tabs>
             </Card>
+            </div>
           </Layout.Section>
           ) : null}
 
