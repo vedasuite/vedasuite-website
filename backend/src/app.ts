@@ -60,6 +60,9 @@ export function createApp() {
 
   app.use(
     helmet({
+      // Disable X-Frame-Options so it doesn't conflict with frame-ancestors CSP.
+      // Shopify admin embeds the app in an iframe; X-Frame-Options: SAMEORIGIN blocks that.
+      frameguard: false,
       contentSecurityPolicy: {
         directives: {
           defaultSrc: ["'self'"],
@@ -200,7 +203,9 @@ export function createApp() {
       );
 
       if (!shop) {
-        return res.status(400).send("Missing shop");
+        // Serve index.html even without a shop so the Partners scanner can see
+        // the App Bridge CDN script, and so App Bridge can handle OAuth client-side.
+        return res.sendFile(frontendIndexPath);
       }
 
       const connectionHealth = await getConnectionHealth(shop, { probeApi: false });

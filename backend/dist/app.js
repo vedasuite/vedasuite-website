@@ -52,6 +52,7 @@ function createApp() {
     const frontendIndexPath = path_1.default.join(frontendDistPath, "index.html");
     morgan_1.default.token("request-id", (req) => req.requestId ?? "-");
     app.use((0, helmet_1.default)({
+        frameguard: false,
         contentSecurityPolicy: {
             directives: {
                 defaultSrc: ["'self'"],
@@ -154,7 +155,7 @@ function createApp() {
         try {
             const shop = (0, shopifyConnectionService_1.normalizeShopDomain)(req.query.shop ?? (0, shopifySessionCookie_1.readShopifySessionCookie)(req));
             if (!shop) {
-                return res.status(400).send("Missing shop");
+                return res.sendFile(frontendIndexPath);
             }
             const connectionHealth = await (0, shopifyConnectionService_1.getConnectionHealth)(shop, { probeApi: false });
             if (!connectionHealth.installationFound || !connectionHealth.hasOfflineToken) {
