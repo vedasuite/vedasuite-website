@@ -1,136 +1,239 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.billingRouter = void 0;
+exports.billingApiRouter = exports.billingRouter = void 0;
 const express_1 = require("express");
+const capabilities_1 = require("../billing/capabilities");
 const env_1 = require("../config/env");
-const prismaClient_1 = require("../db/prismaClient");
 const verifyShopifySessionToken_1 = require("../middleware/verifyShopifySessionToken");
-const shopifyAdminService_1 = require("../services/shopifyAdminService");
+const billingManagementService_1 = require("../services/billingManagementService");
+const subscriptionService_1 = require("../services/subscriptionService");
+const routeShop_1 = require("./routeShop");
 exports.billingRouter = (0, express_1.Router)();
-exports.billingRouter.post("/create-recurring", verifyShopifySessionToken_1.verifyShopifySessionToken, async (req, res) => {
-    const { shop, host, planName, starterModule } = req.body;
-    if (!shop || !planName) {
-        return res.status(400).json({ error: "Missing shop or planName" });
+exports.billingApiRouter = (0, express_1.Router)();
+function buildSubscriptionReturnUrl(params) {
+    const redirectUrl = new URL("/app/billing", env_1.env.shopifyAppUrl);
+    redirectUrl.searchParams.set("shop", params.shop);
+    redirectUrl.searchParams.set("billingResult", params.billingResult);
+    if (params.host) {
+        redirectUrl.searchParams.set("host", params.host);
     }
-    if (planName === "STARTER" && !starterModule) {
-        return res
-            .status(400)
-            .json({ error: "Starter plan requires a starterModule selection." });
+    if (params.intentId) {
+        redirectUrl.searchParams.set("intentId", params.intentId);
     }
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop },
-        include: {
-            subscription: {
-                include: {
-                    plan: true,
-                },
-            },
-        },
-    });
-    if (!store) {
-        return res.status(404).json({ error: "Store not found" });
+    if (params.plan) {
+        redirectUrl.searchParams.set("plan", params.plan);
     }
-    const plan = (await prismaClient_1.prisma.subscriptionPlan.findFirst({
-        where: { name: planName },
-    })) ||
-        (await prismaClient_1.prisma.subscriptionPlan.create({
-            data: {
-                name: planName,
-                price: planName === "STARTER"
-                    ? env_1.env.billing.starterPrice
-                    : planName === "GROWTH"
-                        ? env_1.env.billing.growthPrice
-                        : env_1.env.billing.proPrice,
-                trialDays: env_1.env.billing.trialDays,
-                features: JSON.stringify({ planName }),
-            },
-        }));
-    const returnUrl = new URL(`${env_1.env.shopifyAppUrl}/billing/activate`);
-    returnUrl.searchParams.set("shop", shop);
-    returnUrl.searchParams.set("plan", planName);
-    if (host) {
-        returnUrl.searchParams.set("host", host);
+    if (params.starterModule) {
+        redirectUrl.searchParams.set("starterModule", params.starterModule);
     }
-    if (starterModule) {
-        returnUrl.searchParams.set("starterModule", starterModule);
+    if (params.message) {
+        redirectUrl.searchParams.set("billingMessage", params.message);
+    }
+    return redirectUrl.toString();
+}
+function parseRequestedPlan(value) {
+    const plan = (0, capabilities_1.normalizePlanName)(value);
+    if (!plan || plan === "NONE" || plan === "TRIAL") {
+        return null;
+    }
+    return plan;
+}
+function parseStarterModule(value) {
+    return (0, capabilities_1.normalizeStarterModule)(value);
+}
+exports.billingApiRouter.get("/state", async (req, res) => {
+    const shop = (0, routeShop_1.resolveAuthenticatedShop)(req);
+    if (!shop) {
+        return res.status(400).json({ error: "Missing shop." });
+    }
+    const billing = await (0, billingManagementService_1.getBillingManagementState)(shop);
+    return res.json({ billing });
+});
+exports.billingApiRouter.post("/change-plan", async (req, res) => {
+    const shop = (0, routeShop_1.resolveAuthenticatedShop)(req);
+    const body = req.body;
+    if (!shop) {
+        return res.status(400).json({ error: "Missing shop." });
+    }
+    const plan = parseRequestedPlan(body.plan);
+    if (!plan) {
+        return res.status(400).json({ error: "Unsupported billing plan." });
     }
     try {
-        const billing = await (0, shopifyAdminService_1.createAppSubscription)({
+        const result = await (0, billingManagementService_1.requestBillingPlanChange)({
             shopDomain: shop,
-            name: `VedaSuite AI - ${planName}`,
-            price: plan.price,
-            returnUrl: returnUrl.toString(),
-            trialDays: plan.trialDays,
-            test: process.env.NODE_ENV !== "production",
+            requestedPlan: plan,
+            starterModule: parseStarterModule(body.starterModule),
+            host: body.host ?? null,
+            returnPath: body.returnPath ?? "/app/billing",
+        });
+        return res.json({ result });
+    }
+    catch (error) {
+        return res.status(400).json({
+            error: error instanceof Error ? error.message : "Unable to change billing plan.",
+        });
+    }
+});
+exports.billingApiRouter.post("/cancel-plan", async (req, res) => {
+    const shop = (0, routeShop_1.resolveAuthenticatedShop)(req);
+    const body = req.body;
+    if (!shop) {
+        return res.status(400).json({ error: "Missing shop." });
+    }
+    if (!body.confirm) {
+        return res.status(400).json({
+            error: "Cancellation requires explicit confirmation.",
+        });
+    }
+    try {
+        const result = await (0, billingManagementService_1.cancelBillingPlan)(shop);
+        return res.json({ result });
+    }
+    catch (error) {
+        return res.status(400).json({
+            error: error instanceof Error
+                ? error.message
+                : "Unable to cancel the current subscription.",
+        });
+    }
+});
+exports.billingApiRouter.post("/confirm-return", async (req, res) => {
+    const shop = (0, routeShop_1.resolveAuthenticatedShop)(req);
+    const body = req.body;
+    if (!shop) {
+        return res.status(400).json({ error: "Missing shop." });
+    }
+    try {
+        const result = await (0, billingManagementService_1.confirmBillingApprovalReturn)({
+            shopDomain: shop,
+            intentId: body.intentId ?? null,
+        });
+        const entitlements = (0, subscriptionService_1.buildCanonicalEntitlements)({
+            planName: result.billing.planName,
+            starterModule: result.billing.starterModule,
+            accessActive: result.billing.accessActive,
+            verified: result.billing.verified,
+            trialActive: result.billing.planName === "TRIAL" && result.billing.accessActive,
         });
         return res.json({
-            confirmationUrl: billing.confirmationUrl,
-            pendingSubscriptionId: billing.appSubscription?.id ?? null,
+            result,
+            subscription: result.subscription,
+            billingState: result.billing,
+            entitlements,
         });
     }
     catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to create billing charge.";
-        if (/reauthorize the app/i.test(message)) {
-            const reauthorizeUrl = new URL("/auth/install", env_1.env.shopifyAppUrl);
-            reauthorizeUrl.searchParams.set("shop", shop);
-            return res.status(401).json({
-                error: {
-                    message,
-                    reauthorizeUrl: reauthorizeUrl.toString(),
-                },
-            });
+        return res.status(400).json({
+            error: error instanceof Error
+                ? error.message
+                : "Unable to confirm the Shopify billing return.",
+        });
+    }
+});
+exports.billingRouter.post("/create-recurring", verifyShopifySessionToken_1.verifyShopifySessionToken, async (req, res) => {
+    const shop = (0, routeShop_1.resolveAuthenticatedShop)(req);
+    const body = req.body;
+    if (!shop) {
+        return res.status(400).json({ error: "Missing shop." });
+    }
+    const plan = parseRequestedPlan(body.planName);
+    if (!plan) {
+        return res.status(400).json({ error: "Unsupported billing plan." });
+    }
+    try {
+        const result = await (0, billingManagementService_1.requestBillingPlanChange)({
+            shopDomain: shop,
+            requestedPlan: plan,
+            starterModule: parseStarterModule(body.starterModule),
+            host: body.host ?? null,
+            returnPath: body.returnPath ?? "/app/billing",
+        });
+        if (result.outcome !== "REDIRECT_REQUIRED") {
+            return res.json({ result });
         }
-        throw error;
+        return res.json({
+            confirmationUrl: result.confirmationUrl,
+            pendingIntent: result.pendingIntent,
+        });
+    }
+    catch (error) {
+        const message = error instanceof Error
+            ? error.message
+            : "Unable to create billing charge.";
+        return res.status(400).json({ error: { message } });
+    }
+});
+exports.billingRouter.get("/start", async (req, res) => {
+    const { shop, host, planName, starterModule, returnPath } = req.query;
+    if (!shop || !planName) {
+        return res.status(400).send("Missing shop or planName.");
+    }
+    const normalizedPlan = parseRequestedPlan(planName);
+    if (!normalizedPlan) {
+        return res.status(400).send("Unsupported billing plan.");
+    }
+    try {
+        const result = await (0, billingManagementService_1.requestBillingPlanChange)({
+            shopDomain: shop,
+            requestedPlan: normalizedPlan,
+            starterModule: parseStarterModule(starterModule),
+            host: host ?? null,
+            returnPath: returnPath ?? "/app/billing",
+        });
+        if (result.outcome === "REDIRECT_REQUIRED") {
+            return res.redirect(result.confirmationUrl);
+        }
+        return res.redirect(buildSubscriptionReturnUrl({
+            shop,
+            host: host ?? null,
+            billingResult: result.outcome === "UPDATED" ? "confirmed" : "noop",
+            plan: result.state.subscription.planName,
+            starterModule: result.state.subscription.starterModule,
+            message: result.message,
+        }));
+    }
+    catch (error) {
+        return res.redirect(buildSubscriptionReturnUrl({
+            shop,
+            host: host ?? null,
+            billingResult: "failed",
+            plan: normalizedPlan,
+            starterModule: parseStarterModule(starterModule),
+            message: error instanceof Error
+                ? error.message
+                : "Unable to start Shopify billing approval.",
+        }));
     }
 });
 exports.billingRouter.get("/activate", async (req, res) => {
-    const { shop, plan, starterModule, host } = req.query;
-    if (!shop || !plan) {
+    const { shop, host, intentId } = req.query;
+    if (!shop) {
         return res.status(400).send("Missing billing activation parameters.");
     }
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: String(shop) },
-    });
-    if (!store) {
-        return res.status(404).send("Store not found.");
+    try {
+        const result = await (0, billingManagementService_1.confirmBillingApprovalReturn)({
+            shopDomain: shop,
+            intentId: intentId ?? null,
+        });
+        return res.redirect(buildSubscriptionReturnUrl({
+            shop,
+            host: host ?? null,
+            billingResult: "confirmed",
+            intentId: intentId ?? null,
+            plan: result.subscription.planName,
+            starterModule: result.subscription.starterModule,
+        }));
     }
-    const planRecord = await prismaClient_1.prisma.subscriptionPlan.findFirst({
-        where: { name: String(plan) },
-    });
-    if (!planRecord) {
-        return res.status(404).send("Plan not found.");
+    catch (error) {
+        return res.redirect(buildSubscriptionReturnUrl({
+            shop,
+            host: host ?? null,
+            billingResult: "failed",
+            intentId: intentId ?? null,
+            message: error instanceof Error
+                ? error.message
+                : "Unable to confirm Shopify billing activation.",
+        }));
     }
-    const activeSubscription = await (0, shopifyAdminService_1.getActiveAppSubscription)(String(shop));
-    if (!activeSubscription) {
-        return res.status(400).send("No active Shopify app subscription found.");
-    }
-    await prismaClient_1.prisma.storeSubscription.upsert({
-        where: { storeId: store.id },
-        update: {
-            planId: planRecord.id,
-            starterModule: typeof starterModule === "string" ? starterModule : null,
-            shopifyChargeId: activeSubscription.id,
-            active: true,
-            endsAt: null,
-        },
-        create: {
-            storeId: store.id,
-            planId: planRecord.id,
-            starterModule: typeof starterModule === "string" ? starterModule : null,
-            shopifyChargeId: activeSubscription.id,
-            active: true,
-        },
-    });
-    const redirectUrl = new URL(`${env_1.env.shopifyAppUrl}/subscription`);
-    redirectUrl.searchParams.set("shop", String(shop));
-    redirectUrl.searchParams.set("billing", "activated");
-    redirectUrl.searchParams.set("plan", String(plan));
-    if (typeof host === "string" && host) {
-        redirectUrl.searchParams.set("host", host);
-    }
-    if (typeof starterModule === "string" && starterModule) {
-        redirectUrl.searchParams.set("starterModule", starterModule);
-    }
-    const redirectAppUrl = redirectUrl.toString();
-    return res.redirect(redirectAppUrl);
 });

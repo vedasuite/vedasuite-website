@@ -20,10 +20,11 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useApiClient } from "../../api/client";
 import { ModuleGate } from "../../components/ModuleGate";
-import { EmptyPageState, LoadingPageState } from "../../components/PageState";
+import { useEmbeddedNavigation } from "../../hooks/useEmbeddedNavigation";
 import { useShopifyAdminLinks } from "../../hooks/useShopifyAdminLinks";
 import { useSubscriptionPlan } from "../../hooks/useSubscriptionPlan";
 import { readModuleCache, writeModuleCache } from "../../lib/moduleCache";
+import { withRequestTimeout } from "../../lib/requestTimeout";
 
 type Recommendation = {
   id: string;
@@ -32,6 +33,13 @@ type Recommendation = {
   recommendedPrice: number;
   expectedMarginDelta: number;
   expectedProfitGain?: number | null;
+  demandScore: number;
+  demandTrend: string;
+  demandSignals: string[];
+  competitorPressure: string;
+  automationPosture: string;
+  approvalConfidence: number;
+  autoApprovalCandidate: boolean;
 };
 
 type SimulationResult = {
@@ -39,6 +47,10 @@ type SimulationResult = {
   recommendedPrice: number;
   expectedMarginImprovement: number;
   projectedMonthlyProfitGain: number;
+  demandScore: number;
+  demandTrend: string;
+  automationPosture: string;
+  actionQueue: string;
 };
 
 const resourceName = {
@@ -48,12 +60,13 @@ const resourceName = {
 
 export function PricingPage() {
   const api = useApiClient();
+  const { navigateEmbedded } = useEmbeddedNavigation();
   const { getProductUrl } = useShopifyAdminLinks();
   const [searchParams] = useSearchParams();
   const { subscription, loading: subscriptionLoading } = useSubscriptionPlan();
   const cachedRecs = readModuleCache<Recommendation[]>("pricing-recommendations");
   const [recs, setRecs] = useState<Recommendation[]>(cachedRecs ?? []);
-  const [loading, setLoading] = useState(!cachedRecs);
+  const [loading, setLoading] = useState(false);
   const [selectedTab, setSelectedTab] = useState(0);
   const [simulateOpen, setSimulateOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -71,8 +84,9 @@ export function PricingPage() {
   const focus = searchParams.get("focus");
 
   useEffect(() => {
-    api
-      .get<{ recommendations: Recommendation[] }>("/api/pricing/recommendations")
+    withRequestTimeout(
+      api.get<{ recommendations: Recommendation[] }>("/api/pricing/recommendations")
+    )
       .then((res) => {
         setRecs(res.data.recommendations);
         writeModuleCache("pricing-recommendations", res.data.recommendations);
@@ -90,16 +104,6 @@ export function PricingPage() {
 
     setSelectedTab(0);
   }, [focus]);
-
-  if (subscriptionLoading) {
-    return (
-      <LoadingPageState
-        title="AI Pricing Strategy"
-        subtitle="Preparing pricing intelligence..."
-        message="Loading plan access and pricing recommendations."
-      />
-    );
-  }
 
   const simulate = async () => {
     try {
@@ -128,7 +132,7 @@ export function PricingPage() {
       setToast(
         publishResult?.updated
           ? `Approved ${activeRecommendation.productHandle} and published the price to Shopify across ${publishResult.variantCount ?? 1} variants.`
-          : `Approved ${activeRecommendation.productHandle}. Shopify publish is pending${
+          : `Approved ${activeRecommendation.productHandle}. This recommendation remains in VedaSuite for merchant review${
               publishResult?.reason ? `: ${publishResult.reason}` : "."
             }`
       );
@@ -156,20 +160,103 @@ export function PricingPage() {
       title="AI Pricing Strategy"
       subtitle="Review AI pricing guidance based on margin, competitor movement, and sales velocity."
       requiredPlan="Growth or Pro"
-      allowed={!!subscription?.enabledModules.pricing}
+      allowed={!!subscription?.enabledModules?.pricing}
     >
-      {loading ? (
-        <LoadingPageState
+      {recs.length === 0 ? (
+        <Page
           title="AI Pricing Strategy"
-          subtitle="Preparing pricing intelligence..."
-          message="Loading pricing recommendations and simulations."
-        />
-      ) : recs.length === 0 ? (
-        <EmptyPageState
-          title="AI Pricing Strategy"
-          subtitle="No recommendations available yet."
-          message="Recommendations will appear here once competitor and price history data is available."
-        />
+          subtitle="AI-guided pricing recommendations based on margin, demand posture, and competitor movement."
+          primaryAction={{
+            content: "Open competitor intelligence",
+            onAction: () => navigateEmbedded("/competitor"),
+          }}
+        >
+          <Layout>
+            <Layout.Section>
+              <Banner title="Pricing engine is waiting for more live inputs" tone="info">
+                <p>
+                  Recommendations appear after VedaSuite has enough price history,
+                  competitor signals, and store-sync data to score a product confidently.
+                </p>
+              </Banner>
+            </Layout.Section>
+            <Layout.Section>
+              <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Competitor pressure
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Price and promotion movement from monitored domains helps shape the recommendation queue.
+                    </Text>
+                    <Badge tone="info">Market input</Badge>
+                  </BlockStack>
+                </Card>
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Demand posture
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Sales velocity and pricing posture influence the AI demand score and trend.
+                    </Text>
+                    <Badge tone="success">Demand input</Badge>
+                  </BlockStack>
+                </Card>
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Profit guardrails
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Margin thresholds and approval confidence keep pricing actions merchant-safe.
+                    </Text>
+                    <Badge tone="attention">Guardrail</Badge>
+                  </BlockStack>
+                </Card>
+              </InlineGrid>
+            </Layout.Section>
+            <Layout.Section>
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h3" variant="headingMd">
+                    What will appear here
+                  </Text>
+                  <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
+                    <div className="vs-signal-stat">
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Recommendation queue
+                      </Text>
+                      <Text as="p">
+                        Product, current price, AI price, demand score, approval confidence, and projected gain.
+                      </Text>
+                    </div>
+                    <div className="vs-signal-stat">
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Scenario tools
+                      </Text>
+                      <Text as="p">
+                        Simulation results, automation posture, and merchant-ready approval workflows.
+                      </Text>
+                    </div>
+                  </InlineGrid>
+                  <InlineStack gap="300">
+                    <Button onClick={() => navigateEmbedded("/competitor")}>
+                      Open competitor intelligence
+                    </Button>
+                    <Button onClick={() => navigateEmbedded("/reports")}>
+                      Open reports
+                    </Button>
+                    <Button onClick={() => navigateEmbedded("/subscription")}>
+                      Review plan coverage
+                    </Button>
+                  </InlineStack>
+                </BlockStack>
+              </Card>
+            </Layout.Section>
+          </Layout>
+        </Page>
       ) : (
         <Page
           title="AI Pricing Strategy"
@@ -180,6 +267,13 @@ export function PricingPage() {
           }}
         >
       <Layout>
+        {subscriptionLoading || loading ? (
+          <Layout.Section>
+            <Banner title="Refreshing pricing intelligence" tone="info">
+              <p>Pricing recommendations are loading in the background.</p>
+            </Banner>
+          </Layout.Section>
+        ) : null}
         <Layout.Section>
           <Banner title="Pricing engine active" tone="success">
             <p>
@@ -239,6 +333,7 @@ export function PricingPage() {
                         { title: "Product" },
                         { title: "Current price" },
                         { title: "Recommended price" },
+                        { title: "Demand" },
                         { title: "Margin lift" },
                         { title: "Projected gain" },
                       ]}
@@ -260,6 +355,12 @@ export function PricingPage() {
                               <Text as="span">${rec.recommendedPrice.toFixed(2)}</Text>
                               <Badge tone="success">AI pick</Badge>
                             </InlineGrid>
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <BlockStack gap="100">
+                              <Text as="span">{`${rec.demandScore}/100`}</Text>
+                              <Badge tone="info">{rec.demandTrend}</Badge>
+                            </BlockStack>
                           </IndexTable.Cell>
                           <IndexTable.Cell>
                             {rec.expectedMarginDelta.toFixed(2)}%
@@ -300,6 +401,9 @@ export function PricingPage() {
                             Launch pricing simulation
                           </Button>
                         </InlineStack>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          Approval posture stays guardrail-led until automated pricing is enabled with confidence thresholds.
+                        </Text>
                       </BlockStack>
                     </Card>
                   </InlineGrid>
@@ -351,6 +455,9 @@ export function PricingPage() {
                   {result.expectedMarginImprovement.toFixed(2)} and projected
                   monthly profit gain: $
                   {result.projectedMonthlyProfitGain.toFixed(2)}.
+                </p>
+                <p>
+                  {`Demand score ${result.demandScore}/100 (${result.demandTrend}) | ${result.automationPosture} | ${result.actionQueue}.`}
                 </p>
               </Banner>
             ) : null}
@@ -406,6 +513,23 @@ export function PricingPage() {
                   {(activeRecommendation.expectedProfitGain ?? 0).toFixed(2)}
                 </strong>
               </Text>
+              <Text as="p">
+                Demand posture:{" "}
+                <strong>{`${activeRecommendation.demandTrend} (${activeRecommendation.demandScore}/100)`}</strong>
+              </Text>
+              <Text as="p">
+                Approval confidence: <strong>{activeRecommendation.approvalConfidence}%</strong>
+              </Text>
+              <Text as="p" tone="subdued">
+                {activeRecommendation.automationPosture}
+              </Text>
+              <BlockStack gap="100">
+                {activeRecommendation.demandSignals.map((signal) => (
+                  <Text key={signal} as="p" variant="bodySm" tone="subdued">
+                    {signal}
+                  </Text>
+                ))}
+              </BlockStack>
               {getProductUrl(activeRecommendation.productHandle) ? (
                 <Button
                   url={getProductUrl(activeRecommendation.productHandle) ?? undefined}

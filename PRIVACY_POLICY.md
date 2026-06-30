@@ -36,6 +36,10 @@ We retain data only as long as needed to provide the service, comply with legal 
 
 We do not sell merchant or customer data. Data may be processed by infrastructure, hosting, analytics, and database providers acting on our behalf. Shared fraud intelligence, if enabled by a merchant, should be anonymized before sharing.
 
+## Shared Fraud Intelligence Guardrail
+
+If shared fraud intelligence is enabled, the feature should remain opt-in and limited to anonymized or pseudonymized fraud indicators. Raw customer contact data should not be exposed cross-merchant through this workflow.
+
 ## International Processing
 
 Data may be processed in jurisdictions other than the merchant's location. Where required, reasonable contractual, organizational, and technical safeguards should be applied.

@@ -1,7 +1,14 @@
 import { prisma } from "../db/prismaClient";
+import { env } from "../config/env";
 import { logEvent, withRetry } from "./observabilityService";
+import {
+  forceRefreshOfflineAccessToken,
+  normalizeShopDomain,
+  resolveOfflineInstallation,
+  updateConnectionDiagnostics,
+} from "./shopifyConnectionService";
 
-const SHOPIFY_API_VERSION = "2024-01";
+const SHOPIFY_API_VERSION = env.shopifyAdminApiVersion;
 
 type GraphQLResponse<T> = {
   data?: T;
@@ -14,7 +21,7 @@ function formatBillingPermissionMessage(message: string) {
   }
 
   if (/access denied|not authorized|forbidden|scope/i.test(message)) {
-    return `${message} Reinstall or reauthorize the app with the write_own_subscription scope, then retry billing.`;
+    return `${message} Reinstall or reauthorize the app, confirm billing is allowed for this app in Shopify Partner Dashboard, then retry billing.`;
   }
 
   return message;
@@ -27,64 +34,103 @@ function extractLegacyId(gid?: string | null) {
 }
 
 async function getStoreAccess(shopDomain: string) {
-  const store = await prisma.store.findUnique({
-    where: { shop: shopDomain },
-    select: {
-      id: true,
-      shop: true,
-      accessToken: true,
-      pricingBias: true,
-      profitGuardrail: true,
-    },
-  });
-
-  if (!store) {
-    throw new Error("Store not found");
+  const normalizedShop = normalizeShopDomain(shopDomain);
+  if (!normalizedShop) {
+    throw new Error("Missing Shopify shop domain.");
   }
 
-  return store;
+  const access = await resolveOfflineInstallation(normalizedShop);
+
+  return {
+    id: access.id,
+    shop: access.shop,
+    accessToken: access.accessToken,
+    pricingBias: access.pricingBias,
+    profitGuardrail: access.profitGuardrail,
+  };
 }
 
 export async function shopifyGraphQL<T>(
   shopDomain: string,
   query: string,
-  variables?: Record<string, unknown>
+  variables?: Record<string, unknown>,
+  options: { timeoutMs?: number; _retriedAuth?: boolean } = {}
 ) {
   const store = await getStoreAccess(shopDomain);
-  const response = await fetch(
-    `https://${store.shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": store.accessToken,
-      },
-      body: JSON.stringify({ query, variables }),
-    }
-  );
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 20000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    const text = await response.text();
+  try {
+    const response = await fetch(
+      `https://${store.shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": store.accessToken ?? "",
+        },
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      if (
+        response.status === 401 ||
+        /invalid api key|invalid access token|unrecognized login|wrong password/i.test(
+          text
+        )
+      ) {
+        if (!options._retriedAuth) {
+          try {
+            await forceRefreshOfflineAccessToken(shopDomain);
+            return shopifyGraphQL<T>(shopDomain, query, variables, {
+              timeoutMs,
+              _retriedAuth: true,
+            });
+          } catch {
+            // fall through to structured auth failure below
+          }
+        }
+
+        await updateConnectionDiagnostics(shopDomain, {
+          lastConnectionStatus: "SHOPIFY_AUTH_REQUIRED",
+          lastConnectionError: `Stored Shopify access token is invalid for ${shopDomain}.`,
+          authErrorCode: "SHOPIFY_AUTH_REQUIRED",
+          authErrorMessage: `Stored Shopify access token is invalid for ${shopDomain}. Reauthorize the app and retry.`,
+        });
+
+        throw new Error(
+          `Stored Shopify access token is invalid for ${shopDomain}. Reauthorize the app and retry.`
+        );
+      }
+
+      throw new Error(`Shopify GraphQL request failed: ${response.status} ${text}`);
+    }
+
+    const payload = (await response.json()) as GraphQLResponse<T>;
+    if (payload.errors?.length) {
+      throw new Error(payload.errors.map((error) => error.message).join(", "));
+    }
+
+    return payload.data as T;
+  } catch (error) {
     if (
-      response.status === 401 ||
-      /invalid api key|invalid access token|unrecognized login|wrong password/i.test(
-        text
-      )
+      error instanceof Error &&
+      (error.name === "AbortError" ||
+        /aborted|network request failed|fetch failed/i.test(error.message))
     ) {
       throw new Error(
-        `Stored Shopify access token is invalid for ${shopDomain}. Reauthorize the app and retry.`
+        `Shopify API request timed out for ${shopDomain}. Retry in a few seconds. If this keeps happening, reconnect the app and retry.`
       );
     }
 
-    throw new Error(`Shopify GraphQL request failed: ${response.status} ${text}`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const payload = (await response.json()) as GraphQLResponse<T>;
-  if (payload.errors?.length) {
-    throw new Error(payload.errors.map((error) => error.message).join(", "));
-  }
-
-  return payload.data as T;
 }
 
 export async function createAppSubscription(params: {
@@ -150,7 +196,8 @@ export async function createAppSubscription(params: {
           },
         },
       ],
-    }
+    },
+    { timeoutMs: 60000 }
   );
 
   const payload = data.appSubscriptionCreate;
@@ -199,7 +246,11 @@ export async function getActiveAppSubscription(shopDomain: string) {
 
   const subscriptions =
     data.currentAppInstallation?.activeSubscriptions
-      ?.filter((subscription) => subscription.status === "ACTIVE")
+      ?.filter((subscription) =>
+        ["ACTIVE", "ACCEPTED", "PENDING"].includes(
+          subscription.status?.toUpperCase?.() ?? subscription.status
+        )
+      )
       .sort(
         (left, right) =>
           new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
@@ -239,7 +290,8 @@ export async function cancelAppSubscription(
     {
       id: subscriptionId,
       prorate,
-    }
+    },
+    { timeoutMs: 60000 }
   );
 
   const payload = data.appSubscriptionCancel;
@@ -255,6 +307,10 @@ export async function cancelAppSubscription(
 }
 
 export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
+  const normalizedShop = normalizeShopDomain(shopDomain);
+  if (!normalizedShop) {
+    throw new Error("Missing shop.");
+  }
   const callbackBaseUrl = new URL("/webhooks/shopify", appUrl).toString();
   const desiredTopics = [
     "ORDERS_CREATE",
@@ -263,9 +319,6 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
     "CUSTOMERS_UPDATE",
     "APP_SUBSCRIPTIONS_UPDATE",
     "APP_UNINSTALLED",
-    "CUSTOMERS_DATA_REQUEST",
-    "CUSTOMERS_REDACT",
-    "SHOP_REDACT",
   ];
 
   const existing = await shopifyGraphQL<{
@@ -281,7 +334,7 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
       }>;
     };
   }>(
-    shopDomain,
+    normalizedShop,
     `
       query ExistingWebhooks {
         webhookSubscriptions(first: 50) {
@@ -298,7 +351,9 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
           }
         }
       }
-    `
+    `,
+    undefined,
+    { timeoutMs: 45000 }
   );
 
   const existingKeys = new Set(
@@ -313,15 +368,27 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
     const callbackUrl = `${callbackBaseUrl}/${topic.toLowerCase()}`;
     const key = `${topic}|${callbackUrl}`;
     if (existingKeys.has(key)) {
+      logEvent("info", "shopify.webhook.registration_skipped", {
+        shop: normalizedShop,
+        topic,
+        callbackUrl,
+        reason: "already_registered",
+      });
       continue;
     }
+
+    logEvent("info", "shopify.webhook.registration_attempt", {
+      shop: normalizedShop,
+      topic,
+      callbackUrl,
+    });
 
     const createdWebhook = await shopifyGraphQL<{
       webhookSubscriptionCreate: {
         userErrors: Array<{ message: string }>;
       };
     }>(
-      shopDomain,
+      normalizedShop,
       `
         mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $callbackUrl: URL!) {
           webhookSubscriptionCreate(
@@ -340,19 +407,53 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
       {
         topic,
         callbackUrl,
-      }
+      },
+      { timeoutMs: 45000 }
     );
 
     if (createdWebhook.webhookSubscriptionCreate.userErrors.length) {
-      throw new Error(
-        createdWebhook.webhookSubscriptionCreate.userErrors
-          .map((error) => error.message)
-          .join(", ")
-      );
+      const failureMessage = createdWebhook.webhookSubscriptionCreate.userErrors
+        .map((error) => error.message)
+        .join(", ");
+
+      logEvent("error", "shopify.webhook.registration_failed", {
+        shop: normalizedShop,
+        topic,
+        callbackUrl,
+        reason: failureMessage,
+      });
+
+      await updateConnectionDiagnostics(normalizedShop, {
+        lastWebhookRegistrationStatus: "FAILED",
+        lastConnectionStatus: "WEBHOOK_REGISTRATION_FAILED",
+        lastConnectionError: failureMessage,
+        authErrorCode: "WEBHOOK_REGISTRATION_FAILED",
+        authErrorMessage: failureMessage,
+      });
+
+      throw new Error(failureMessage);
     }
 
     created.push(topic);
+    logEvent("info", "shopify.webhook.registration_succeeded", {
+      shop: normalizedShop,
+      topic,
+      callbackUrl,
+    });
   }
+
+  await prisma.store.update({
+    where: { shop: normalizedShop },
+    data: {
+      webhooksRegisteredAt: new Date(),
+      lastWebhookRegistrationStatus: "SUCCEEDED",
+      lastConnectionCheckAt: new Date(),
+      lastConnectionStatus: "OK",
+      lastConnectionError: null,
+      authErrorCode: null,
+      authErrorMessage: null,
+    },
+  });
 
   return {
     created,
@@ -361,6 +462,10 @@ export async function registerSyncWebhooks(shopDomain: string, appUrl: string) {
 }
 
 export async function getSyncWebhookStatus(shopDomain: string, appUrl: string) {
+  const normalizedShop = normalizeShopDomain(shopDomain);
+  if (!normalizedShop) {
+    throw new Error("Missing shop.");
+  }
   const callbackBaseUrl = new URL("/webhooks/shopify", appUrl).toString();
   const desiredTopics = [
     "ORDERS_CREATE",
@@ -369,9 +474,6 @@ export async function getSyncWebhookStatus(shopDomain: string, appUrl: string) {
     "CUSTOMERS_UPDATE",
     "APP_SUBSCRIPTIONS_UPDATE",
     "APP_UNINSTALLED",
-    "CUSTOMERS_DATA_REQUEST",
-    "CUSTOMERS_REDACT",
-    "SHOP_REDACT",
   ];
 
   const existing = await shopifyGraphQL<{
@@ -387,7 +489,7 @@ export async function getSyncWebhookStatus(shopDomain: string, appUrl: string) {
       }>;
     };
   }>(
-    shopDomain,
+    normalizedShop,
     `
       query ExistingWebhooks {
         webhookSubscriptions(first: 50) {
@@ -404,7 +506,9 @@ export async function getSyncWebhookStatus(shopDomain: string, appUrl: string) {
           }
         }
       }
-    `
+    `,
+    undefined,
+    { timeoutMs: 45000 }
   );
 
   const webhooks = desiredTopics.map((topic) => {
@@ -437,6 +541,7 @@ type SyncQueryResponse = {
           id: string;
           handle: string;
           title: string;
+          status: string;
           variants: {
             edges: Array<{
               node: {
@@ -482,20 +587,22 @@ function computeRecommendedPrice(currentPrice: number, pricingBias: number) {
   return Number((currentPrice * (1 + lift)).toFixed(2));
 }
 
-function computeOptimalPrice(
-  currentPrice: number,
-  pricingBias: number,
-  profitGuardrail: number
-) {
-  const lift = Math.max(0.02, (pricingBias + profitGuardrail - 55) / 200);
-  return Number((currentPrice * (1 + lift)).toFixed(2));
-}
-
 export async function fetchCompetitorSnapshot(
   domain: string,
   productHandle: string,
   fallbackPrice: number
-) {
+): Promise<{
+  competitorUrl: string;
+  price: number | null;
+  promotion: string | null;
+  stockStatus: string;
+  source: string;
+  adCopy: string | null;
+  confidenceScore: number;
+  confidenceLabel: "high" | "medium" | "low";
+  matchReason: string;
+  usedFallbackPrice: boolean;
+} | null> {
   try {
     return await withRetry(
       async () => {
@@ -526,17 +633,49 @@ export async function fetchCompetitorSnapshot(
               /property="product:price:amount"\s+content="([0-9]+(?:\.[0-9]{1,2})?)"/i
             );
 
+          const promotionDetected = /sale|discount|bundle|offer/.test(lowerHtml);
+          const stockStatus = /out of stock/.test(lowerHtml)
+            ? "out_of_stock"
+            : /low stock/.test(lowerHtml)
+            ? "low_stock"
+            : "in_stock";
+          const extractedPrice = priceMatch ? Number(priceMatch[1]) : null;
+          const usedFallbackPrice = extractedPrice == null && fallbackPrice > 0;
+          const signalScore =
+            (extractedPrice != null ? 48 : 0) +
+            (promotionDetected ? 18 : 0) +
+            (stockStatus !== "in_stock" ? 14 : 0) +
+            (lowerHtml.includes(productHandle.toLowerCase()) ? 12 : 0);
+          const confidenceScore = Math.max(
+            18,
+            Math.min(96, signalScore + (usedFallbackPrice ? 6 : 0))
+          );
+
+          if (extractedPrice == null && !promotionDetected && stockStatus === "in_stock") {
+            return null;
+          }
+
           return {
-            price: priceMatch ? Number(priceMatch[1]) : fallbackPrice,
-            promotion: /sale|discount|bundle|offer/.test(lowerHtml)
-              ? "Live promo detected"
-              : null,
-            stockStatus: /out of stock/.test(lowerHtml)
-              ? "out_of_stock"
-              : /low stock/.test(lowerHtml)
-              ? "low_stock"
-              : "in_stock",
+            competitorUrl: `https://${domain}/products/${productHandle}`,
+            price: extractedPrice ?? (usedFallbackPrice ? fallbackPrice : null),
+            promotion: promotionDetected ? "Live promo detected" : null,
+            stockStatus,
             source: "website_live",
+            adCopy: null,
+            confidenceScore,
+            confidenceLabel:
+              confidenceScore >= 80
+                ? "high"
+                : confidenceScore >= 60
+                ? "medium"
+                : "low",
+            matchReason:
+              extractedPrice != null
+                ? "Product page and live price were confirmed on the competitor domain."
+                : promotionDetected
+                ? "Product page matched by handle and a live promotion signal was detected."
+                : "Product page matched by handle, but price confirmation relied on limited page signals.",
+            usedFallbackPrice,
           };
         } finally {
           clearTimeout(timeout);
@@ -562,9 +701,19 @@ export async function fetchCompetitorSnapshot(
 }
 
 export async function syncShopifyStoreData(shopDomain: string) {
-  const store = await getStoreAccess(shopDomain);
+  const normalizedShop = normalizeShopDomain(shopDomain);
+  if (!normalizedShop) {
+    throw new Error("Missing shop.");
+  }
+  const syncStartedAt = new Date();
+  logEvent("info", "shopify.sync.started", {
+    shop: normalizedShop,
+    startedAt: syncStartedAt.toISOString(),
+  });
+
+  const store = await getStoreAccess(normalizedShop);
   const data = await shopifyGraphQL<SyncQueryResponse>(
-    shopDomain,
+    normalizedShop,
     `
       query SyncStoreData {
         shop {
@@ -575,10 +724,12 @@ export async function syncShopifyStoreData(shopDomain: string) {
                 id
                 handle
                 title
-                variants(first: 1) {
+                status
+                variants(first: 25) {
                   edges {
                     node {
                       id
+                      title
                       price
                     }
                   }
@@ -613,11 +764,40 @@ export async function syncShopifyStoreData(shopDomain: string) {
           }
         }
       }
-    `
+    `,
+    undefined,
+    { timeoutMs: 60000 }
   );
 
   const products = data.shop.products.edges.map((edge) => edge.node);
   const orders = data.shop.orders.edges.map((edge) => edge.node);
+  const syncCounts = {
+    fetched: {
+      products: products.length,
+      orders: orders.length,
+      customers: orders.filter((order) => !!order.customer?.legacyResourceId).length,
+      variants: products.reduce(
+        (sum, product) => sum + product.variants.edges.length,
+        0
+      ),
+    },
+    saved: {
+      productsCreated: 0,
+      productsUpdated: 0,
+      variantsCreated: 0,
+      variantsUpdated: 0,
+      ordersCreated: 0,
+      ordersUpdated: 0,
+      customersCreated: 0,
+      customersUpdated: 0,
+      priceRowsCreated: 0,
+      priceRowsUpdated: 0,
+    },
+    skipped: {
+      products: 0,
+      variants: 0,
+    },
+  };
 
   for (const orderNode of orders) {
     let customerId: string | null = null;
@@ -647,6 +827,12 @@ export async function syncShopifyStoreData(shopDomain: string) {
             },
           });
 
+      if (existingCustomer) {
+        syncCounts.saved.customersUpdated += 1;
+      } else {
+        syncCounts.saved.customersCreated += 1;
+      }
+
       customerId = customer.id;
     }
 
@@ -656,28 +842,59 @@ export async function syncShopifyStoreData(shopDomain: string) {
       normalizedStatus.includes("partially_refunded");
     const refundRequested = refunded || orderNode.tags.some((tag) => /refund/i.test(tag));
 
-    await prisma.order.upsert({
-      where: { shopifyOrderId: orderNode.legacyResourceId },
-      create: {
+    const displayOrderId = orderNode.name || orderNode.legacyResourceId || orderNode.id;
+    const existingOrder = await prisma.order.findFirst({
+      where: {
         storeId: store.id,
-        customerId,
-        shopifyOrderId: orderNode.legacyResourceId,
-        totalAmount: Number(orderNode.currentTotalPriceSet.shopMoney.amount),
-        currency: orderNode.currentTotalPriceSet.shopMoney.currencyCode,
-        status: normalizedStatus,
-        refunded,
-        refundRequested,
-        createdAt: new Date(orderNode.createdAt),
+        OR: [
+          { shopifyOrderGid: orderNode.id },
+          { shopifyLegacyOrderId: orderNode.legacyResourceId },
+          { shopifyOrderId: displayOrderId },
+        ],
       },
-      update: {
-        customerId,
-        totalAmount: Number(orderNode.currentTotalPriceSet.shopMoney.amount),
-        currency: orderNode.currentTotalPriceSet.shopMoney.currencyCode,
-        status: normalizedStatus,
-        refunded,
-        refundRequested,
-      },
+      select: { id: true },
     });
+
+    if (existingOrder) {
+      await prisma.order.update({
+        where: { id: existingOrder.id },
+        data: {
+          customerId,
+          shopifyOrderId: displayOrderId,
+          shopifyOrderGid: orderNode.id,
+          shopifyLegacyOrderId: orderNode.legacyResourceId,
+          orderName: orderNode.name,
+          totalAmount: Number(orderNode.currentTotalPriceSet.shopMoney.amount),
+          currency: orderNode.currentTotalPriceSet.shopMoney.currencyCode,
+          status: normalizedStatus,
+          refunded,
+          refundRequested,
+        },
+      });
+    } else {
+      await prisma.order.create({
+        data: {
+          storeId: store.id,
+          customerId,
+          shopifyOrderId: displayOrderId,
+          shopifyOrderGid: orderNode.id,
+          shopifyLegacyOrderId: orderNode.legacyResourceId,
+          orderName: orderNode.name,
+          totalAmount: Number(orderNode.currentTotalPriceSet.shopMoney.amount),
+          currency: orderNode.currentTotalPriceSet.shopMoney.currencyCode,
+          status: normalizedStatus,
+          refunded,
+          refundRequested,
+          createdAt: new Date(orderNode.createdAt),
+        },
+      });
+    }
+
+    if (existingOrder) {
+      syncCounts.saved.ordersUpdated += 1;
+    } else {
+      syncCounts.saved.ordersCreated += 1;
+    }
   }
 
   const customers = await prisma.customer.findMany({
@@ -724,223 +941,231 @@ export async function syncShopifyStoreData(shopDomain: string) {
   }
 
   for (const product of products) {
-    const firstVariant = product.variants.edges[0]?.node;
+    const variants = product.variants.edges.map((edge) => edge.node);
+    const firstVariant = variants[0];
     const currentPrice = Number(firstVariant?.price ?? 0);
-    if (!product.handle || !currentPrice) {
+    if (!product.handle || variants.length === 0 || !currentPrice) {
+      syncCounts.skipped.products += 1;
       continue;
     }
 
-    const latestPriceHistory = await prisma.priceHistory.findFirst({
+    const existingProduct = await prisma.productSnapshot.findUnique({
       where: {
-        storeId: store.id,
-        productHandle: product.handle,
+        storeId_shopifyProductId: {
+          storeId: store.id,
+          shopifyProductId: product.id,
+        },
       },
-      orderBy: { createdAt: "desc" },
+      select: { id: true },
     });
 
-    const recommendedPrice = computeRecommendedPrice(currentPrice, store.pricingBias);
-    if (
-      !latestPriceHistory ||
-      latestPriceHistory.currentPrice !== currentPrice ||
-      latestPriceHistory.recommendedPrice !== recommendedPrice
-    ) {
-      await prisma.priceHistory.create({
-        data: {
+    const savedProduct = await prisma.productSnapshot.upsert({
+      where: {
+        storeId_shopifyProductId: {
           storeId: store.id,
-          productHandle: product.handle,
-          currentPrice,
-          recommendedPrice,
-          expectedMarginDelta: Number(
-            (((recommendedPrice - currentPrice) / currentPrice) * 100).toFixed(2)
-          ),
-          expectedProfitGain: Number(
-            ((recommendedPrice - currentPrice) * 40).toFixed(2)
-          ),
-          rationaleJson: JSON.stringify({
-            source: "shopify_sync",
-            productTitle: product.title,
-            shopifyProductGid: product.id,
-            shopifyVariantGid: firstVariant?.id ?? null,
-            status: "pending",
-            syncedAt: new Date().toISOString(),
-          }),
+          shopifyProductId: product.id,
         },
-      });
+      },
+      create: {
+        storeId: store.id,
+        shopifyProductId: product.id,
+        handle: product.handle,
+        title: product.title,
+        status: product.status.toLowerCase(),
+        variantCount: variants.length,
+        currentPrice,
+        currency: orders[0]?.currentTotalPriceSet.shopMoney.currencyCode ?? null,
+        syncedAt: new Date(),
+      },
+      update: {
+        handle: product.handle,
+        title: product.title,
+        status: product.status.toLowerCase(),
+        variantCount: variants.length,
+        currentPrice,
+        currency: orders[0]?.currentTotalPriceSet.shopMoney.currencyCode ?? null,
+        syncedAt: new Date(),
+      },
+    });
+
+    if (existingProduct) {
+      syncCounts.saved.productsUpdated += 1;
+    } else {
+      syncCounts.saved.productsCreated += 1;
     }
 
-    const latestProfitRecord = await prisma.profitOptimizationData.findFirst({
+    for (const variant of variants) {
+      if (!variant.id || !variant.title) {
+        syncCounts.skipped.variants += 1;
+        continue;
+      }
+
+      const existingVariant = await prisma.variantSnapshot.findUnique({
+        where: {
+          productSnapshotId_shopifyVariantId: {
+            productSnapshotId: savedProduct.id,
+            shopifyVariantId: variant.id,
+          },
+        },
+        select: { id: true },
+      }).catch(() => null);
+
+      await prisma.variantSnapshot.upsert({
+        where: {
+          productSnapshotId_shopifyVariantId: {
+            productSnapshotId: savedProduct.id,
+            shopifyVariantId: variant.id,
+          },
+        },
+        create: {
+          productSnapshotId: savedProduct.id,
+          shopifyVariantId: variant.id,
+          title: variant.title,
+          price: Number(variant.price),
+          currency: orders[0]?.currentTotalPriceSet.shopMoney.currencyCode ?? null,
+        },
+        update: {
+          title: variant.title,
+          price: Number(variant.price),
+          currency: orders[0]?.currentTotalPriceSet.shopMoney.currencyCode ?? null,
+        },
+      });
+
+      if (existingVariant) {
+        syncCounts.saved.variantsUpdated += 1;
+      } else {
+        syncCounts.saved.variantsCreated += 1;
+      }
+    }
+
+    const recommendedPrice = computeRecommendedPrice(currentPrice, store.pricingBias);
+    const existingPriceRows = await prisma.priceHistory.count({
       where: {
         storeId: store.id,
         productHandle: product.handle,
       },
-      orderBy: { createdAt: "desc" },
     });
 
-    const optimalPrice = computeOptimalPrice(
-      currentPrice,
-      store.pricingBias,
-      store.profitGuardrail
-    );
-    if (
-      !latestProfitRecord ||
-      latestProfitRecord.sellingPrice !== currentPrice ||
-      latestProfitRecord.optimalPrice !== optimalPrice
-    ) {
-      const productCost = Number((currentPrice * 0.58).toFixed(2));
-      await prisma.profitOptimizationData.create({
-        data: {
-          storeId: store.id,
-          productHandle: product.handle,
-          productCost,
-          sellingPrice: currentPrice,
-          competitorAveragePrice: Number((currentPrice * 0.97).toFixed(2)),
-          advertisingSpend: Number((currentPrice * 0.12).toFixed(2)),
-          shippingCost: Number((currentPrice * 0.06).toFixed(2)),
-          returnRate: 0.08,
-          salesVelocity: 18,
-          optimalPrice,
-          projectedMarginIncrease: Number(
-            (((optimalPrice - currentPrice) / currentPrice) * 100).toFixed(2)
-          ),
-          projectedMonthlyProfit: Number(
-            ((optimalPrice - productCost) * 18 * 30).toFixed(2)
-          ),
-          bundleSuggestionsJson: JSON.stringify([
-            `Bundle ${product.title} with a complementary bestseller.`,
-          ]),
-          discountStrategyJson: JSON.stringify({
-            guardrail: store.profitGuardrail,
-            strategy: "Avoid broad discounting while competitor stock remains constrained.",
-          }),
-        },
-      });
+    await prisma.priceHistory.deleteMany({
+      where: {
+        storeId: store.id,
+        productHandle: product.handle,
+      },
+    });
+
+    await prisma.priceHistory.create({
+      data: {
+        storeId: store.id,
+        productHandle: product.handle,
+        currentPrice,
+        recommendedPrice,
+        expectedMarginDelta: Number(
+          (((recommendedPrice - currentPrice) / currentPrice) * 100).toFixed(2)
+        ),
+        expectedProfitGain: null,
+        rationaleJson: JSON.stringify({
+          source: "shopify_sync_baseline",
+          productTitle: product.title,
+          shopifyProductGid: product.id,
+          shopifyVariantGid: firstVariant?.id ?? null,
+          status: "baseline",
+          syncedAt: new Date().toISOString(),
+          demandTrend: "insufficient history",
+          demandSignals: [
+            "This baseline pricing target uses the current Shopify catalog price and merchant pricing settings.",
+            "Projected profit impact is not shown until enough live order and margin history is available.",
+            `Pricing bias is ${store.pricingBias}/100 and profit guardrail is ${store.profitGuardrail}%.`,
+          ],
+          evidenceSignals: [
+            "Current product price from Shopify catalog",
+            "Merchant pricing bias setting",
+            "Merchant profit guardrail setting",
+          ],
+          competitorPressure: "not_available",
+        }),
+      },
+    });
+
+    if (existingPriceRows > 0) {
+      syncCounts.saved.priceRowsUpdated += 1;
+    } else {
+      syncCounts.saved.priceRowsCreated += 1;
     }
   }
 
+  const savedTotal =
+    syncCounts.saved.productsCreated +
+    syncCounts.saved.productsUpdated +
+    syncCounts.saved.variantsCreated +
+    syncCounts.saved.variantsUpdated +
+    syncCounts.saved.ordersCreated +
+    syncCounts.saved.ordersUpdated +
+    syncCounts.saved.customersCreated +
+    syncCounts.saved.customersUpdated +
+    syncCounts.saved.priceRowsCreated +
+    syncCounts.saved.priceRowsUpdated;
+
+  const fetchedTotal =
+    syncCounts.fetched.products +
+    syncCounts.fetched.orders +
+    syncCounts.fetched.customers +
+    syncCounts.fetched.variants;
+
+  if (fetchedTotal > 0 && savedTotal === 0) {
+    throw new Error(
+      "Shopify sync fetched records but nothing was persisted. Check mapping and upserts."
+    );
+  }
+
+  const status =
+    syncCounts.fetched.products === 0 &&
+    syncCounts.fetched.orders === 0 &&
+    syncCounts.fetched.customers === 0
+      ? "SUCCEEDED_NO_DATA"
+      : "SUCCEEDED";
+
+  logEvent("info", "shopify.sync.completed", {
+    shop: normalizedShop,
+    startedAt: syncStartedAt.toISOString(),
+    finishedAt: new Date().toISOString(),
+    status,
+    counts: syncCounts,
+  });
+
   return {
+    startedAt: syncStartedAt.toISOString(),
     syncedAt: new Date().toISOString(),
+    status,
     productsSynced: products.length,
     ordersSynced: orders.length,
     customersSynced: orders.filter((order) => order.customer?.legacyResourceId).length,
-  };
-}
-
-type ProductLookupResponse = {
-  products: {
-    edges: Array<{
-      node: {
-        id: string;
-        handle: string;
-        variants: {
-          edges: Array<{
-            node: {
-              id: string;
-              title: string;
-              price: string;
-            };
-          }>;
-        };
-      };
-    }>;
-  };
-};
-
-export async function publishProductPrice(
-  shopDomain: string,
-  productHandle: string,
-  nextPrice: number
-) {
-  const lookup = await shopifyGraphQL<ProductLookupResponse>(
-    shopDomain,
-    `
-      query ProductByHandle($query: String!) {
-        products(first: 1, query: $query) {
-          edges {
-            node {
-              id
-              handle
-              variants(first: 25) {
-                edges {
-                  node {
-                    id
-                    title
-                    price
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    `,
-    { query: `handle:${productHandle}` }
-  );
-
-  const product = lookup.products.edges[0]?.node;
-  const variants = product?.variants.edges.map((edge) => edge.node) ?? [];
-  if (!product?.id || variants.length === 0) {
-    return { updated: false, reason: "No matching Shopify product variant found." };
-  }
-
-  const baseVariantPrice = Number(variants[0]?.price ?? 0);
-  const priceDelta = nextPrice - baseVariantPrice;
-
-  const mutation = await shopifyGraphQL<{
-    productVariantsBulkUpdate: {
-      userErrors: Array<{ message: string }>;
-    };
-  }>(
-    shopDomain,
-    `
-      mutation UpdateVariantPrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-        productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-          userErrors {
-            message
-          }
-        }
-      }
-    `,
-    {
-      productId: product.id,
-      variants: variants.map((variant, index) => {
-        const currentPrice = Number(variant.price ?? 0);
-        const variantPrice =
-          index === 0 ? nextPrice : Math.max(0.01, currentPrice + priceDelta);
-
-        return {
-          id: variant.id,
-          price: variantPrice.toFixed(2),
-        };
-      }),
-    }
-  );
-
-  const errors = mutation.productVariantsBulkUpdate.userErrors;
-  if (errors.length) {
-    return { updated: false, reason: errors.map((error) => error.message).join(", ") };
-  }
-
-  return {
-    updated: true,
-    productHandle,
-    variantCount: variants.length,
-    price: nextPrice,
+    counts: syncCounts,
   };
 }
 
 export async function tagShopifyOrder(
   shopDomain: string,
-  shopifyOrderId: string,
+  orderReference: {
+    shopifyOrderGid?: string | null;
+    shopifyLegacyOrderId?: string | null;
+    orderName?: string | null;
+  },
   tags: string[]
 ) {
-  if (!/^\d+$/.test(shopifyOrderId)) {
+  const orderGid =
+    orderReference.shopifyOrderGid && orderReference.shopifyOrderGid.startsWith("gid://shopify/Order/")
+      ? orderReference.shopifyOrderGid
+      : orderReference.shopifyLegacyOrderId && /^\d+$/.test(orderReference.shopifyLegacyOrderId)
+      ? `gid://shopify/Order/${orderReference.shopifyLegacyOrderId}`
+      : null;
+
+  if (!orderGid) {
     return {
       updated: false,
-      reason: "Order does not have a Shopify numeric order id yet.",
+      reason:
+        "Review status saved in VedaSuite. Shopify tagging will be available after the order is fully synced.",
     };
   }
-
-  const orderGid = `gid://shopify/Order/${shopifyOrderId}`;
   const mutation = await shopifyGraphQL<{
     tagsAdd: {
       userErrors: Array<{ message: string }>;
@@ -967,7 +1192,7 @@ export async function tagShopifyOrder(
     return { updated: false, reason: errors.map((error) => error.message).join(", ") };
   }
 
-  return { updated: true, shopifyOrderId, tags };
+  return { updated: true, shopifyOrderGid: orderGid, tags };
 }
 
 export { extractLegacyId };

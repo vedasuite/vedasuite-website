@@ -1,13 +1,32 @@
 import { prisma } from "../db/prismaClient";
+import {
+  deriveSyncStatus,
+  getStoreOperationalSnapshot,
+} from "./storeOperationalStateService";
+
+function maskCustomerLabel(value?: string | null, fallback = "Shopper profile") {
+  if (!value) {
+    return fallback;
+  }
+
+  if (value.includes("@")) {
+    const [prefix] = value.split("@");
+    return `${prefix.slice(0, 2)}***`;
+  }
+
+  return `${value.slice(0, 3)}***`;
+}
 
 export async function getWeeklyReport(shopDomain: string) {
-  const store = await prisma.store.findUnique({
-    where: { shop: shopDomain },
-  });
+  const [store, operational] = await Promise.all([
+    prisma.store.findUnique({
+      where: { shop: shopDomain },
+    }),
+    getStoreOperationalSnapshot(shopDomain),
+  ]);
   if (!store) throw new Error("Store not found");
 
   const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
   const startOfToday = new Date(new Date().setHours(0, 0, 0, 0));
 
   const [
@@ -20,6 +39,8 @@ export async function getWeeklyReport(shopDomain: string) {
     topPricingMoves,
     topProfitProducts,
     competitorHighlights,
+    timelineEvents,
+    latestSyncJob,
   ] = await Promise.all([
     prisma.order.count({
       where: {
@@ -38,10 +59,7 @@ export async function getWeeklyReport(shopDomain: string) {
       where: { storeId: store.id, createdAt: { gte: since } },
     }),
     prisma.order.findMany({
-      where: {
-        storeId: store.id,
-        createdAt: { gte: since },
-      },
+      where: { storeId: store.id, createdAt: { gte: since } },
       orderBy: { createdAt: "asc" },
     }),
     prisma.customer.findMany({
@@ -64,7 +82,28 @@ export async function getWeeklyReport(shopDomain: string) {
       orderBy: { collectedAt: "desc" },
       take: 30,
     }),
+    prisma.timelineEvent.findMany({
+      where: { storeId: store.id, createdAt: { gte: since } },
+      orderBy: { createdAt: "desc" },
+      take: 12,
+    }),
+    prisma.syncJob.findFirst({
+      where: { storeId: store.id },
+      orderBy: { createdAt: "desc" },
+    }),
   ]);
+
+  const syncState = deriveSyncStatus({
+    connectionStatus: operational.store.lastConnectionStatus,
+    latestSyncJobStatus: operational.latestSyncJob?.status ?? null,
+    lastSyncStatus: operational.store.lastSyncStatus,
+    products: operational.counts.products,
+    orders: operational.counts.orders,
+    customers: operational.counts.customers,
+    priceRows: operational.counts.pricingRows,
+    profitRows: operational.counts.profitRows,
+    timelineEvents: operational.counts.timelineEvents,
+  });
 
   const dailyMap = new Map<
     string,
@@ -112,8 +151,14 @@ export async function getWeeklyReport(shopDomain: string) {
 
   const competitorByProduct = new Map<
     string,
-    { records: number; promotions: number; latestPrice?: number | null; earliestPrice?: number | null }
+    {
+      records: number;
+      promotions: number;
+      latestPrice?: number | null;
+      earliestPrice?: number | null;
+    }
   >();
+
   for (const row of [...competitorHighlights].reverse()) {
     const bucket = competitorByProduct.get(row.productHandle) ?? {
       records: 0,
@@ -122,9 +167,7 @@ export async function getWeeklyReport(shopDomain: string) {
       earliestPrice: null,
     };
     bucket.records += 1;
-    if (row.promotion) {
-      bucket.promotions += 1;
-    }
+    if (row.promotion) bucket.promotions += 1;
     if (bucket.earliestPrice == null && row.price != null) {
       bucket.earliestPrice = row.price;
     }
@@ -149,26 +192,79 @@ export async function getWeeklyReport(shopDomain: string) {
 
   const health = {
     revenueTrend:
-      totalRevenue >= 4000 ? "Strong" : totalRevenue >= 1500 ? "Stable" : "Emerging",
+      orders.length === 0
+        ? "Awaiting first sync"
+        : totalRevenue >= 4000
+        ? "Strong"
+        : totalRevenue >= 1500
+        ? "Stable"
+        : "Emerging",
     fraudPressure:
       fraudHighRisk >= 8 ? "High" : fraudHighRisk >= 3 ? "Medium" : "Low",
     marketPressure:
-      competitorEvents >= 25 ? "High" : competitorEvents >= 10 ? "Medium" : "Low",
+      competitorEvents >= 25 ? "High" : competitorEvents >= 10 ? "Medium" : competitorEvents > 0 ? "Low" : "Awaiting competitor data",
     pricingMomentum:
-      pricingSuggestions >= 8 ? "High" : pricingSuggestions >= 3 ? "Medium" : "Low",
+      pricingSuggestions >= 8 ? "High" : pricingSuggestions >= 3 ? "Medium" : pricingSuggestions > 0 ? "Low" : "Awaiting pricing data",
   };
 
-  const recommendations = [
-    fraudHighRisk > 0
-      ? "Review the high-risk fraud queue before approving fulfillment for flagged orders."
-      : "Fraud pressure is low this week; keep shared signals enabled and continue monitoring.",
-    competitorEvents >= 10
-      ? "Competitor movement is elevated; review promotion clusters before broad discounting."
-      : "Competitor activity is stable; focus on margin-protective pricing instead of reactive offers.",
-    profitOpportunities > 0
-      ? "Use the Profit Optimization engine on top-selling SKUs to capture the identified margin lift."
-      : "Profit engine opportunities are light this week; use the pricing module to create fresh simulations.",
-  ];
+  const recommendations: string[] = [];
+  if (syncState.status === "NOT_CONNECTED") {
+    recommendations.push(
+      "Reconnect Shopify before reviewing weekly reports so VedaSuite can validate the store installation."
+    );
+  } else if (syncState.status === "SYNC_REQUIRED") {
+    recommendations.push(
+      "Update store insights so VedaSuite can build the weekly report from Shopify activity."
+    );
+  } else if (syncState.status === "SYNC_IN_PROGRESS") {
+    recommendations.push(
+      "Store insights are updating. Refresh this report shortly to review the latest activity."
+    );
+  } else if (syncState.status === "SYNC_COMPLETED_PROCESSING_PENDING") {
+    recommendations.push(
+      "Store activity is being analyzed for pricing, trust, and profit insights."
+    );
+  } else if (fraudHighRisk > 0) {
+    recommendations.push(
+      "Review the high-risk fraud queue before approving fulfillment for flagged orders."
+    );
+  } else if (orders.length === 0) {
+    recommendations.push(
+      "More Shopify order activity is needed before fraud and abuse guidance appears."
+    );
+  } else {
+    recommendations.push(
+      "Fraud pressure is currently low; continue reviewing new orders and refund requests."
+    );
+  }
+
+  if (competitorEvents >= 10) {
+    recommendations.push(
+      "Competitor movement is elevated; review promotion clusters before broad discounting."
+    );
+  } else if (competitorEvents > 0) {
+    recommendations.push(
+      "Competitor activity is light; watch the latest market moves before reacting."
+    );
+  } else {
+    recommendations.push(
+      "Add competitor domains and run ingestion to unlock live competitor reports."
+    );
+  }
+
+  if (profitOpportunities > 0) {
+    recommendations.push(
+      "Use the Pricing & Profit engine on top-selling SKUs to capture the identified margin lift."
+    );
+  } else if (pricingSuggestions > 0) {
+    recommendations.push(
+      "Pricing recommendations are available, but profit opportunities are still limited."
+    );
+  } else {
+    recommendations.push(
+      "Sync orders and products first so VedaSuite can generate pricing and profit guidance."
+    );
+  }
 
   return {
     since,
@@ -180,6 +276,8 @@ export async function getWeeklyReport(shopDomain: string) {
     },
     health,
     recommendations,
+    setupState: syncState.status,
+    readiness: syncState,
     fraud: {
       highRiskOrders: fraudHighRisk,
     },
@@ -192,13 +290,26 @@ export async function getWeeklyReport(shopDomain: string) {
     profit: {
       opportunitiesIdentified: profitOpportunities,
     },
+    sync: {
+      latestStatus: syncState.status,
+      latestFinishedAt: latestSyncJob?.finishedAt?.toISOString() ?? null,
+      latestJobStatus: latestSyncJob?.status ?? null,
+    },
     trends: Array.from(dailyMap.values()).map((bucket) => ({
       ...bucket,
       revenue: Number(bucket.revenue.toFixed(2)),
     })),
+    timelineHighlights: timelineEvents.map((event) => ({
+      category: event.category,
+      eventType: event.eventType,
+      title: event.title,
+      detail: event.detail,
+      severity: event.severity,
+      occurredAt: event.createdAt.toISOString(),
+    })),
     customers: {
       topRisky: topRiskCustomers.map((customer) => ({
-        email: customer.email,
+        email: maskCustomerLabel(customer.email),
         creditScore: customer.creditScore,
         refundRate: Number((customer.refundRate * 100).toFixed(1)),
         totalRefunds: customer.totalRefunds,
@@ -219,4 +330,3 @@ export async function getWeeklyReport(shopDomain: string) {
     competitorHighlights: competitorMomentum,
   };
 }
-

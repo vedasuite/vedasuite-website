@@ -9,7 +9,7 @@ import {
   redactShopData,
 } from "../services/privacyService";
 import { reconcileStoreSubscriptionFromWebhook } from "../services/subscriptionService";
-import { syncShopifyStoreData } from "../services/shopifyAdminService";
+import { runStoreSyncJob, type SyncTriggerSource } from "../services/syncJobService";
 
 export const shopifyWebhookRouter = Router();
 
@@ -46,12 +46,18 @@ async function handleSyncWebhook(req: any, res: any) {
     return res.status(400).send("Missing shop domain");
   }
 
+  // Acknowledge immediately — Shopify counts any non-200 as a failure and retries.
+  // Process the sync job asynchronously so errors don't surface as 5xx to Shopify.
+  res.status(200).send("ok");
+
   logEvent("info", "webhook.sync_received", {
     topic: req.path,
     shop: shopDomain,
   });
 
-  await withRetry(() => syncShopifyStoreData(shopDomain), {
+  const triggerSource = req.path.replace("/", "") as SyncTriggerSource;
+
+  void withRetry(() => runStoreSyncJob(shopDomain, triggerSource), {
     attempts: 3,
     delayMs: 300,
     operationName: "webhook.shopify_sync",
@@ -59,8 +65,13 @@ async function handleSyncWebhook(req: any, res: any) {
       topic: req.path,
       shop: shopDomain,
     },
+  }).catch((error) => {
+    logEvent("error", "webhook.sync_job_failed", {
+      topic: req.path,
+      shop: shopDomain,
+      error,
+    });
   });
-  return res.status(200).send("ok");
 }
 
 async function handleWebhookEnvelope(req: any, res: any) {
@@ -100,19 +111,37 @@ async function handleAppUninstalled(req: any, res: any) {
 
   await prisma.$transaction(async (tx) => {
     if (store.subscription) {
-      await tx.storeSubscription.delete({
+      await tx.storeSubscription.update({
         where: { id: store.subscription.id },
+        data: {
+          active: false,
+          billingStatus: "UNINSTALLED",
+          cancelledAt: new Date(),
+          lastBillingWebhookProcessedAt: new Date(),
+          lastBillingResolutionSource: "webhook_app_uninstalled",
+          lastBillingSubscriptionName: null,
+        } as any,
       });
     }
 
-    await tx.fraudSignal.deleteMany({ where: { storeId: store.id } });
-    await tx.order.deleteMany({ where: { storeId: store.id } });
-    await tx.customer.deleteMany({ where: { storeId: store.id } });
-    await tx.competitorData.deleteMany({ where: { storeId: store.id } });
-    await tx.competitorDomain.deleteMany({ where: { storeId: store.id } });
-    await tx.priceHistory.deleteMany({ where: { storeId: store.id } });
-    await tx.profitOptimizationData.deleteMany({ where: { storeId: store.id } });
-    await tx.store.delete({ where: { id: store.id } });
+    await tx.store.update({
+      where: { id: store.id },
+      data: {
+        accessToken: null,
+        refreshToken: null,
+        accessTokenExpiresAt: null,
+        refreshTokenExpiresAt: null,
+        uninstalledAt: new Date(),
+        webhooksRegisteredAt: null,
+        lastWebhookRegistrationStatus: "UNINSTALLED",
+        lastSyncStatus: "UNINSTALLED",
+        lastConnectionCheckAt: new Date(),
+        lastConnectionStatus: "UNINSTALLED",
+        lastConnectionError: "Shopify app uninstall webhook received.",
+        authErrorCode: "UNINSTALLED",
+        authErrorMessage: "Shopify app uninstall webhook received.",
+      },
+    });
   });
 
   logEvent("info", "webhook.app_uninstalled", {
@@ -193,6 +222,9 @@ async function handleAppSubscriptionUpdate(req: any, res: any) {
 
   logEvent("info", "webhook.app_subscription_updated", {
     shop: envelope.shopDomain,
+    route: req.path,
+    processedAt: new Date().toISOString(),
+    subscriptionId: payload.admin_graphql_api_id ?? null,
     status: payload.status ?? null,
     planName: payload.name ?? null,
   });

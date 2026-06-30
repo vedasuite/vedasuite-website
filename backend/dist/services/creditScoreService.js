@@ -3,7 +3,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.listCustomerScores = listCustomerScores;
 exports.getCustomerScore = getCustomerScore;
 exports.recomputeCustomerScore = recomputeCustomerScore;
+exports.getTrustOperatingLayer = getTrustOperatingLayer;
 const prismaClient_1 = require("../db/prismaClient");
+const maskCustomerIdentity_1 = require("../lib/maskCustomerIdentity");
 function classifyCredit(score) {
     if (score >= 80)
         return "Trusted Buyer";
@@ -12,9 +14,31 @@ function classifyCredit(score) {
     return "Risky Buyer";
 }
 function mapCustomer(customer) {
+    const refundRatePercent = Number((customer.refundRate * 100).toFixed(1));
+    const orderCompletionRate = customer.totalOrders === 0
+        ? 0
+        : Number((((customer.totalOrders - customer.totalRefunds) / customer.totalOrders) *
+            100).toFixed(1));
+    const reasons = [];
+    if (refundRatePercent >= 35) {
+        reasons.push("Refund behavior is materially above the store baseline.");
+    }
+    if (customer.fraudSignalsCount >= 2) {
+        reasons.push("Fraud signal count is elevated for this shopper.");
+    }
+    if (customer.paymentReliability <= 10) {
+        reasons.push("Payment reliability is weak and needs closer review.");
+    }
+    if (orderCompletionRate >= 90 && customer.creditScore >= 80) {
+        reasons.push("Order completion is strong, supporting fast-lane handling.");
+    }
+    if (reasons.length === 0) {
+        reasons.push("Current shopper behavior remains within normal trust thresholds.");
+    }
     return {
         id: customer.id,
-        email: customer.email,
+        email: (0, maskCustomerIdentity_1.maskCustomerIdentity)(customer.email, `shopper-${customer.id.slice(-4)}`),
+        shopifyCustomerId: customer.shopifyCustomerId ?? null,
         totalOrders: customer.totalOrders,
         totalRefunds: customer.totalRefunds,
         refundRate: customer.refundRate,
@@ -22,10 +46,16 @@ function mapCustomer(customer) {
         paymentReliability: customer.paymentReliability,
         creditScore: customer.creditScore,
         creditCategory: customer.creditCategory,
-        orderCompletionRate: customer.totalOrders === 0
-            ? 0
-            : Number((((customer.totalOrders - customer.totalRefunds) / customer.totalOrders) *
-                100).toFixed(1)),
+        orderCompletionRate,
+        confidence: Math.max(42, Math.min(96, Math.round(customer.creditScore * 0.6 +
+            Math.min(18, customer.totalOrders * 2) -
+            customer.fraudSignalsCount * 3))),
+        automationPosture: customer.creditScore >= 80
+            ? "Eligible for trusted-buyer fast-lane"
+            : customer.creditScore < 50
+                ? "Route into review-first trust controls"
+                : "Use standard handling with periodic review",
+        reasons,
     };
 }
 async function listCustomerScores(shopDomain) {
@@ -72,4 +102,89 @@ async function recomputeCustomerScore(customerId) {
         data: { creditScore: score, creditCategory: category },
     });
     return mapCustomer(updated);
+}
+async function getTrustOperatingLayer(shopDomain) {
+    const store = await prismaClient_1.prisma.store.findUnique({
+        where: { shop: shopDomain },
+    });
+    if (!store)
+        throw new Error("Store not found");
+    const customers = await prismaClient_1.prisma.customer.findMany({
+        where: { storeId: store.id },
+        orderBy: [{ creditScore: "asc" }, { refundRate: "desc" }],
+        take: 100,
+    });
+    const mappedCustomers = customers.map(mapCustomer);
+    const segments = {
+        trusted: mappedCustomers.filter((customer) => customer.creditScore >= 80).length,
+        normal: mappedCustomers.filter((customer) => customer.creditScore >= 50 && customer.creditScore < 80).length,
+        risky: mappedCustomers.filter((customer) => customer.creditScore < 50).length,
+    };
+    const policyRecommendations = [
+        {
+            id: "trusted_fast_lane",
+            title: "Trusted buyer fast-lane",
+            audience: "Trusted buyers (80-100)",
+            recommendation: "Offer lower-friction post-purchase support and prioritize fulfillment confidence.",
+            operationalAction: "Use trusted buyers as the lowest-friction service segment.",
+            automationMode: "Low-touch automation",
+            confidence: 86,
+        },
+        {
+            id: "normal_watch",
+            title: "Normal buyer watch layer",
+            audience: "Normal buyers (50-79)",
+            recommendation: "Maintain standard refund handling and review rising refund or fraud patterns.",
+            operationalAction: "Escalate only when fraud signals or refund frequency increase.",
+            automationMode: "Advisory automation",
+            confidence: 71,
+        },
+        {
+            id: "risky_controls",
+            title: "Risky buyer controls",
+            audience: "Risky buyers (0-49)",
+            recommendation: "Pair refund decisions with fraud review and consider tighter verification before fulfillment.",
+            operationalAction: "Route risky buyers into fraud review before policy exceptions.",
+            automationMode: "Review-first automation",
+            confidence: 91,
+        },
+    ];
+    const priorityProfiles = mappedCustomers.slice(0, 5).map((customer) => ({
+        id: customer.id,
+        email: (0, maskCustomerIdentity_1.maskCustomerIdentity)(customer.email, `shopper-${customer.id.slice(-4)}`),
+        shopifyCustomerId: customer.shopifyCustomerId,
+        creditScore: customer.creditScore,
+        creditCategory: customer.creditCategory,
+        refundRate: Number((customer.refundRate * 100).toFixed(1)),
+        fraudSignalsCount: customer.fraudSignalsCount,
+        paymentReliability: customer.paymentReliability,
+        operationalTag: customer.creditScore < 50
+            ? "Review before refund exception"
+            : customer.creditScore >= 80
+                ? "Trusted handling candidate"
+                : "Standard review",
+        reasons: customer.reasons,
+        confidence: customer.confidence,
+        automationPosture: customer.automationPosture,
+    }));
+    const automationRules = [
+        {
+            id: "trusted_refund_fast_lane",
+            title: "Trusted refund fast-lane",
+            status: segments.trusted > 0 ? "Ready" : "Warm-up",
+            detail: "Trusted buyers can bypass low-value refund escalations when fraud signals remain quiet.",
+        },
+        {
+            id: "risky_exception_gate",
+            title: "Risky shopper exception gate",
+            status: segments.risky > 0 ? "Ready" : "Monitor",
+            detail: "Require fraud review before approving manual refund or fulfillment exceptions for risky buyers.",
+        },
+    ];
+    return {
+        segments,
+        policyRecommendations,
+        priorityProfiles,
+        automationRules,
+    };
 }

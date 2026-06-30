@@ -3,21 +3,19 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getProfitRecommendations = getProfitRecommendations;
 exports.getProfitOpportunities = getProfitOpportunities;
 const prismaClient_1 = require("../db/prismaClient");
+const subscriptionService_1 = require("./subscriptionService");
 async function assertProPlan(shopDomain) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
-        include: {
-            subscription: {
-                include: {
-                    plan: true,
-                },
-            },
-        },
-    });
+    const [store, subscription] = await Promise.all([
+        prismaClient_1.prisma.store.findUnique({
+            where: { shop: shopDomain },
+        }),
+        (0, subscriptionService_1.getCurrentSubscription)(shopDomain),
+    ]);
     if (!store)
         throw new Error("Store not found");
-    const storePlan = store.subscription?.plan;
-    if (!storePlan || storePlan.name !== "PRO") {
+    const hasFullProfitAccess = subscription.enabledModules.pricing &&
+        subscription.featureAccess.fullProfitEngine;
+    if (!hasFullProfitAccess) {
         throw new Error("AI Profit Optimization Engine is available only on PRO.");
     }
     return store;

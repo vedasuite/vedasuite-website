@@ -2,54 +2,187 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getDashboardMetrics = getDashboardMetrics;
 const prismaClient_1 = require("../db/prismaClient");
-async function getDashboardMetrics(shopDomain) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
-    });
-    if (!store) {
+const competitorService_1 = require("./competitorService");
+const onboardingService_1 = require("./onboardingService");
+const pricingProfitService_1 = require("./pricingProfitService");
+const readinessEngineService_1 = require("./readinessEngineService");
+const storeOperationalStateService_1 = require("./storeOperationalStateService");
+const trustAbuseService_1 = require("./trustAbuseService");
+const merchantLabels_1 = require("../lib/merchantLabels");
+function latestIsoTimestamp(...values) {
+    const timestamps = values
+        .map((value) => (value ? new Date(value).getTime() : null))
+        .filter((value) => value != null && !Number.isNaN(value));
+    if (timestamps.length === 0) {
         return null;
     }
-    const [todayHighRiskOrders, serialReturners, competitorChanges, pricingSuggestions, profitOpportunities,] = await Promise.all([
-        prismaClient_1.prisma.order.count({
-            where: {
-                storeId: store.id,
-                fraudRiskLevel: "High",
-                createdAt: {
-                    gte: new Date(new Date().setHours(0, 0, 0, 0)),
+    return new Date(Math.max(...timestamps)).toISOString();
+}
+function buildDashboardSummaryTitle(status) {
+    if (status === "READY_WITH_DATA") {
+        return "Your store is connected and ready";
+    }
+    if (status === "SYNC_COMPLETED_PROCESSING_PENDING") {
+        return "Your store activity is being analyzed";
+    }
+    if (status === "EMPTY_STORE_DATA") {
+        return "More store activity is needed for insights";
+    }
+    if (status === "FAILED") {
+        return "Store connection needs attention";
+    }
+    if (status === "SYNC_IN_PROGRESS") {
+        return "Updating store insights";
+    }
+    return "Connect store activity to begin insights";
+}
+function isActionableDashboardEvent(input) {
+    if (input.category === "orders" || input.eventType === "refund_requested") {
+        return !!input.orderLabel && ["critical", "warning"].includes(input.severity);
+    }
+    if (input.category === "abuse" || input.category === "trust") {
+        return ["critical", "warning"].includes(input.severity);
+    }
+    if (input.category === "competitor") {
+        return input.eventType.includes("price") || input.eventType.includes("promotion");
+    }
+    if (input.category === "pricing" || input.category === "profit") {
+        return ["critical", "warning", "success"].includes(input.severity);
+    }
+    return ["critical", "warning"].includes(input.severity);
+}
+async function getDashboardMetrics(shopDomain) {
+    const [store, operational, onboarding, readiness] = await Promise.all([
+        prismaClient_1.prisma.store.findUnique({
+            where: { shop: shopDomain },
+            include: {
+                syncJobs: {
+                    orderBy: { createdAt: "desc" },
+                    take: 1,
+                },
+                timelineEvents: {
+                    orderBy: { createdAt: "desc" },
+                    take: 50,
                 },
             },
         }),
+        (0, storeOperationalStateService_1.getStoreOperationalSnapshot)(shopDomain).catch(() => null),
+        (0, onboardingService_1.getOnboardingState)(shopDomain).catch(() => null),
+        (0, readinessEngineService_1.getUnifiedReadinessState)(shopDomain).catch(() => null),
+    ]);
+    if (!store) {
+        return null;
+    }
+    const [trustOverview, competitorOverview, pricingOverview, serialReturners,] = await Promise.all([
+        (0, trustAbuseService_1.getTrustAbuseOverview)(shopDomain).catch(() => null),
+        (0, competitorService_1.getCompetitorOverview)(shopDomain).catch(() => null),
+        (0, pricingProfitService_1.getPricingProfitOverview)(shopDomain).catch(() => null),
         prismaClient_1.prisma.customer.count({
             where: {
                 storeId: store.id,
                 refundRate: { gt: 0.3 },
             },
-        }),
-        prismaClient_1.prisma.competitorData.count({
-            where: {
-                storeId: store.id,
-                collectedAt: {
-                    gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
-                },
-            },
-        }),
-        prismaClient_1.prisma.priceHistory.count({
-            where: {
-                storeId: store.id,
-                createdAt: {
-                    gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
-                },
-            },
-        }),
-        prismaClient_1.prisma.profitOptimizationData.count({
-            where: {
-                storeId: store.id,
-                createdAt: {
-                    gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
-                },
-            },
-        }),
+        }).catch(() => 0),
     ]);
+    const todayHighRiskOrders = trustOverview?.summary?.highRiskOrders ?? 0;
+    const competitorChanges = (competitorOverview?.competitorState?.detectedPriceChangesCount ?? 0) +
+        (competitorOverview?.competitorState?.detectedPromotionChangesCount ?? 0);
+    const pricingSuggestions = pricingOverview?.summary?.recommendationCount ?? 0;
+    const profitOpportunities = pricingOverview?.summary?.profitOpportunityCount ?? 0;
+    const syncState = operational
+        ? (0, storeOperationalStateService_1.deriveSyncStatus)({
+            connectionStatus: operational.store.lastConnectionStatus,
+            latestSyncJobStatus: operational.latestSyncJob?.status ?? null,
+            lastSyncStatus: operational.store.lastSyncStatus,
+            products: operational.counts.products,
+            orders: operational.counts.orders,
+            customers: operational.counts.customers,
+            priceRows: operational.counts.pricingRows,
+            profitRows: operational.counts.profitRows,
+            timelineEvents: operational.counts.timelineEvents,
+        })
+        : {
+            status: "SYNC_REQUIRED",
+            reason: "Run the first live sync to populate the store.",
+        };
+    const lastRefreshedAt = operational
+        ? latestIsoTimestamp(operational.latestProcessingAt, operational.latestCompetitorAt, operational.latestSyncJob?.finishedAt ??
+            operational.latestSyncJob?.startedAt ??
+            null, operational.store.lastSyncAt)
+        : null;
+    const moduleStates = readiness?.moduleStates ?? null;
+    const summaryTitle = buildDashboardSummaryTitle(syncState.status);
+    const recentInsights = store.timelineEvents.flatMap((event) => {
+        const metadata = (() => {
+            if (!event.metadataJson) {
+                return {};
+            }
+            try {
+                return JSON.parse(event.metadataJson);
+            }
+            catch {
+                return {};
+            }
+        })();
+        const orderLabel = typeof metadata.orderLabel === "string" && !(0, merchantLabels_1.isInternalOrderLabel)(metadata.orderLabel)
+            ? metadata.orderLabel
+            : null;
+        if (!isActionableDashboardEvent({
+            category: event.category,
+            eventType: event.eventType,
+            severity: event.severity,
+            orderLabel,
+        })) {
+            return [];
+        }
+        return [{
+                id: event.id,
+                title: (0, merchantLabels_1.formatMerchantInsightTitle)({
+                    category: event.category,
+                    eventType: event.eventType,
+                    orderLabel,
+                    severity: event.severity,
+                }),
+                detail: (0, merchantLabels_1.formatMerchantInsightDetail)({
+                    category: event.category,
+                    eventType: event.eventType,
+                    orderLabel,
+                    detail: event.detail,
+                }),
+                severity: event.severity,
+                createdAt: event.createdAt.toISOString(),
+                route: event.category === "competitor"
+                    ? "/app/competitor-intelligence"
+                    : event.category === "pricing" || event.category === "profit"
+                        ? "/app/ai-pricing-engine"
+                        : "/app/fraud-intelligence",
+            }];
+    }).slice(0, 5);
+    const quickAccess = readiness?.quickAccess ?? null;
+    const syncHealthReason = readiness?.setup.summaryDescription ?? syncState.reason;
+    const dashboardState = {
+        refreshedAt: lastRefreshedAt,
+        syncHealth: {
+            status: readiness?.initialSync.syncStatus ?? syncState.status,
+            title: readiness?.setup.summaryTitle ?? summaryTitle,
+            reason: syncHealthReason,
+        },
+        kpis: {
+            fraudAlerts: todayHighRiskOrders,
+            competitorChanges,
+            pricingOpportunities: pricingSuggestions,
+            profitOpportunities,
+        },
+        recentInsights,
+        quickAccess,
+        refreshSummary: {
+            visibleKpiChanged: false,
+            recentInsightsChanged: false,
+            quickAccessChanged: false,
+            changedSections: [],
+            unchangedSections: ["KPI cards", "Recent insights", "Quick access", "Sync health"],
+        },
+    };
     return {
         fraudAlertsToday: todayHighRiskOrders,
         highRiskOrders: todayHighRiskOrders,
@@ -58,5 +191,34 @@ async function getDashboardMetrics(shopDomain) {
         promotionAlerts: competitorChanges,
         aiPricingSuggestions: pricingSuggestions,
         profitOptimizationOpportunities: profitOpportunities,
+        lastSyncStatus: store.syncJobs[0]?.status ?? "NOT_RUN",
+        lastSyncAt: store.syncJobs[0]?.finishedAt?.toISOString() ?? null,
+        timelineEventsGenerated: store.timelineEvents.length,
+        dataState: syncState.status,
+        lastRefreshedAt,
+        summaryTitle,
+        summaryDetail: syncHealthReason,
+        recentInsights,
+        moduleReadiness: readiness
+            ? {
+                trustAbuse: {
+                    readinessState: readiness.modules.fraud.state,
+                    reason: readiness.modules.fraud.description,
+                },
+                competitor: {
+                    readinessState: readiness.modules.competitor.state,
+                    reason: readiness.modules.competitor.description,
+                },
+                pricingProfit: {
+                    readinessState: readiness.modules.pricing.state,
+                    reason: readiness.modules.pricing.description,
+                },
+            }
+            : null,
+        moduleStates,
+        dashboardState,
+        persistedCounts: operational?.counts ?? null,
+        onboarding,
+        readiness,
     };
 }

@@ -1,17 +1,21 @@
 import { Router } from "express";
+import { requireFeature } from "../middleware/requireFeature";
 import {
+  getCompetitorResponseEngine,
   getCompetitorOverview,
   ingestCompetitorSnapshots,
   listCompetitorConnectors,
   listTrackedCompetitorProducts,
   updateCompetitorDomains,
 } from "../services/competitorService";
+import { resolveAuthenticatedShop } from "./routeShop";
 
 export const competitorRouter = Router();
+competitorRouter.use(requireFeature("competitor"));
 
 competitorRouter.get("/overview", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
 
@@ -20,8 +24,8 @@ competitorRouter.get("/overview", async (req, res) => {
 });
 
 competitorRouter.get("/products", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
 
@@ -30,8 +34,8 @@ competitorRouter.get("/products", async (req, res) => {
 });
 
 competitorRouter.get("/connectors", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
 
@@ -39,11 +43,23 @@ competitorRouter.get("/connectors", async (req, res) => {
   return res.json({ connectors });
 });
 
+competitorRouter.get("/response-engine", async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
+    return res.status(400).json({ error: "Missing shop." });
+  }
+
+  const responseEngine = await getCompetitorResponseEngine(shop);
+  return res.json({ responseEngine });
+});
+
 competitorRouter.post("/domains", async (req, res) => {
-  const { shop, domains } = req.body as {
+  const body = req.body as {
     shop: string;
     domains: { domain: string; label?: string }[];
   };
+  const shop = resolveAuthenticatedShop(req) ?? body.shop;
+  const domains = body.domains;
 
   if (!shop || !domains) {
     return res.status(400).json({ error: "Missing shop or domains." });
@@ -54,7 +70,8 @@ competitorRouter.post("/domains", async (req, res) => {
 });
 
 competitorRouter.post("/ingest", async (req, res) => {
-  const { shop } = req.body as { shop: string };
+  const body = req.body as { shop?: string };
+  const shop = resolveAuthenticatedShop(req) ?? body.shop;
 
   if (!shop) {
     return res.status(400).json({ error: "Missing shop." });

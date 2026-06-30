@@ -3,7 +3,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.scoreOrderFraud = scoreOrderFraud;
 exports.listRecentFraudOrders = listRecentFraudOrders;
 exports.applyFraudAction = applyFraudAction;
+exports.getFraudIntelligenceOverview = getFraudIntelligenceOverview;
+const crypto_1 = require("crypto");
 const prismaClient_1 = require("../db/prismaClient");
+const maskCustomerIdentity_1 = require("../lib/maskCustomerIdentity");
+const merchantLabels_1 = require("../lib/merchantLabels");
 const shopifyAdminService_1 = require("./shopifyAdminService");
 function mapScoreToRisk(score) {
     if (score <= 30)
@@ -11,6 +15,106 @@ function mapScoreToRisk(score) {
     if (score <= 70)
         return "Medium";
     return "High";
+}
+function buildSharedNetworkHash(signals) {
+    const fingerprintSeed = [
+        signals.email?.trim().toLowerCase(),
+        signals.deviceFingerprint?.trim(),
+        signals.paymentFingerprint?.trim(),
+        signals.shippingAddress?.trim().toLowerCase(),
+    ]
+        .filter(Boolean)
+        .join("|");
+    if (!fingerprintSeed) {
+        return null;
+    }
+    return (0, crypto_1.createHash)("sha256").update(fingerprintSeed).digest("hex");
+}
+function buildFraudReasons(signals, score) {
+    const reasons = [];
+    if ((signals.refundHistoryScore ?? 0) >= 18) {
+        reasons.push("Refund history is elevated for this shopper profile.");
+    }
+    if ((signals.orderFrequencyScore ?? 0) >= 15) {
+        reasons.push("Order frequency is abnormal for the recent order window.");
+    }
+    if (signals.ipAddress?.startsWith("10.")) {
+        reasons.push("IP address falls into an internal or low-trust range.");
+    }
+    if (signals.email?.endsWith("+fraud@test.com")) {
+        reasons.push("Email pattern matches a known test or abuse format.");
+    }
+    if (signals.deviceFingerprint && !signals.paymentFingerprint) {
+        reasons.push("Device is known but payment identity is incomplete.");
+    }
+    if (reasons.length === 0) {
+        reasons.push(score >= 71
+            ? "Multiple order signals combined into a high-risk fraud profile."
+            : "Current order signals remain inside normal operating thresholds.");
+    }
+    return reasons;
+}
+function buildFraudConfidence(score, reasonCount) {
+    return Math.max(46, Math.min(96, Math.round(score * 0.55 + reasonCount * 9)));
+}
+function buildFraudRecommendedAction(score) {
+    if (score >= 85) {
+        return "Block order";
+    }
+    if (score >= 71) {
+        return "Send to manual review";
+    }
+    if (score >= 45) {
+        return "Flag order";
+    }
+    return "Allow order";
+}
+function buildAutomationPosture(score, riskLevel) {
+    if (score >= 85) {
+        return {
+            mode: "eligible",
+            title: "Auto-block candidate",
+            detail: "This signal is strong enough to support an automated block rule after merchant approval.",
+        };
+    }
+    if (riskLevel === "High") {
+        return {
+            mode: "review_required",
+            title: "Review before automation",
+            detail: "Route to manual review first, then promote the pattern into an automation if it repeats.",
+        };
+    }
+    if (riskLevel === "Medium") {
+        return {
+            mode: "monitor",
+            title: "Monitor for repeat pattern",
+            detail: "Track this pattern and only automate when a second or third matching signal appears.",
+        };
+    }
+    return {
+        mode: "safe",
+        title: "Low automation pressure",
+        detail: "This order is safe to approve manually and does not need a new automation rule.",
+    };
+}
+function buildWardrobingReasons(customer) {
+    const reasons = [];
+    if (customer.refundRate >= 0.45) {
+        reasons.push("Refund rate is materially above the store average.");
+    }
+    if (customer.totalRefunds >= 3) {
+        reasons.push("Multiple refunds have been recorded across recent orders.");
+    }
+    if (customer.totalOrders >= 4 && customer.totalRefunds >= 2) {
+        reasons.push("The buy-use-return pattern is repeating across multiple orders.");
+    }
+    if (customer.paymentReliability <= 8) {
+        reasons.push("Payment reliability is weak relative to the shopper's order volume.");
+    }
+    if (reasons.length === 0) {
+        reasons.push("Wardrobing risk is elevated from combined return-behavior signals.");
+    }
+    return reasons;
 }
 async function scoreOrderFraud(shopDomain, orderId, signals) {
     const store = await prismaClient_1.prisma.store.findUnique({
@@ -33,6 +137,10 @@ async function scoreOrderFraud(shopDomain, orderId, signals) {
     }
     score = Math.max(0, Math.min(100, score));
     const riskLevel = mapScoreToRisk(score);
+    const sharedNetworkHash = buildSharedNetworkHash(signals);
+    const reasons = buildFraudReasons(signals, score);
+    const confidence = buildFraudConfidence(score, reasons.length);
+    const recommendedAction = buildFraudRecommendedAction(score);
     const order = await prismaClient_1.prisma.order.update({
         where: { id: orderId },
         data: {
@@ -44,6 +152,7 @@ async function scoreOrderFraud(shopDomain, orderId, signals) {
         data: {
             storeId: store.id,
             orderId: order.id,
+            customerId: order.customerId,
             ipAddress: signals.ipAddress,
             email: signals.email,
             shippingAddress: signals.shippingAddress,
@@ -53,9 +162,18 @@ async function scoreOrderFraud(shopDomain, orderId, signals) {
             orderFrequency: signals.orderFrequencyScore?.toString(),
             riskScore: score,
             riskLevel,
+            sharedNetworkHash: store.sharedFraudNetwork ? sharedNetworkHash : null,
         },
     });
-    return { orderId: order.id, fraudScore: score, riskLevel };
+    return {
+        orderId: order.id,
+        fraudScore: score,
+        riskLevel,
+        confidence,
+        recommendedAction,
+        reasons,
+        automationPosture: buildAutomationPosture(score, riskLevel),
+    };
 }
 async function listRecentFraudOrders(shopDomain) {
     const store = await prismaClient_1.prisma.store.findUnique({
@@ -96,9 +214,181 @@ async function applyFraudAction(shopDomain, orderId, action) {
         `vedasuite:${action}`,
         `fraud-risk:${order.fraudRiskLevel.toLowerCase()}`,
     ];
-    const shopifyTagResult = await (0, shopifyAdminService_1.tagShopifyOrder)(shopDomain, order.shopifyOrderId, tags);
+    const shopifyTagResult = await (0, shopifyAdminService_1.tagShopifyOrder)(shopDomain, {
+        shopifyOrderGid: order.shopifyOrderGid ?? null,
+        shopifyLegacyOrderId: order.shopifyLegacyOrderId ?? null,
+        orderName: order.orderName ?? order.shopifyOrderId,
+    }, tags);
     return {
         ...order,
         shopifyTagResult,
+        merchantMessage: shopifyTagResult.updated
+            ? "Review status saved in VedaSuite and synced to Shopify."
+            : shopifyTagResult.reason,
+    };
+}
+async function getFraudIntelligenceOverview(shopDomain) {
+    const store = await prismaClient_1.prisma.store.findUnique({
+        where: { shop: shopDomain },
+        include: {
+            orders: {
+                orderBy: { createdAt: "desc" },
+                take: 100,
+            },
+            customers: {
+                orderBy: [{ refundRate: "desc" }, { updatedAt: "desc" }],
+                take: 50,
+            },
+            fraudSignals: {
+                include: {
+                    order: true,
+                },
+                orderBy: { createdAt: "desc" },
+                take: 200,
+            },
+        },
+    });
+    if (!store) {
+        throw new Error("Store not found");
+    }
+    const sharedHashCounts = new Map();
+    for (const signal of store.fraudSignals) {
+        if (signal.sharedNetworkHash) {
+            sharedHashCounts.set(signal.sharedNetworkHash, (sharedHashCounts.get(signal.sharedNetworkHash) ?? 0) + 1);
+        }
+    }
+    const networkMatches = store.fraudSignals
+        .filter((signal) => !!signal.sharedNetworkHash &&
+        (sharedHashCounts.get(signal.sharedNetworkHash) ?? 0) > 1 &&
+        !!(0, merchantLabels_1.getMerchantOrderLabelOrNull)(signal.order))
+        .slice(0, 5)
+        .map((signal) => {
+        const repeatSignals = sharedHashCounts.get(signal.sharedNetworkHash) ?? 1;
+        const reasons = [
+            repeatSignals >= 4
+                ? "Fingerprint has repeated across multiple stored fraud events."
+                : "Fingerprint is recurring inside the current merchant history.",
+            signal.email
+                ? "Email-linked behavior is contributing to the shared match."
+                : "Identity overlap comes from non-email behavioral fingerprints.",
+        ];
+        const confidence = Math.min(97, 52 + repeatSignals * 10);
+        return {
+            id: signal.id,
+            orderLabel: (0, merchantLabels_1.getMerchantOrderLabelOrNull)(signal.order),
+            customerId: signal.customerId,
+            riskLevel: signal.riskLevel,
+            repeatSignals,
+            email: (0, maskCustomerIdentity_1.maskCustomerIdentity)(signal.email, "Customer profile"),
+            confidence,
+            recommendedAction: signal.riskLevel === "High" ? "Manual review" : "Flag for repeat watch",
+            reasons,
+            automationPosture: repeatSignals >= 3
+                ? "Eligible for shared-network automation rules"
+                : "Monitor until the match repeats again",
+        };
+    });
+    const wardrobingSignals = store.customers
+        .filter((customer) => customer.totalOrders >= 3)
+        .map((customer) => {
+        const score = Math.min(100, Math.round(customer.refundRate * 70 +
+            Math.min(18, customer.totalRefunds * 4) +
+            Math.max(0, 12 - customer.paymentReliability / 2)));
+        const reasons = buildWardrobingReasons(customer);
+        const likely = customer.refundRate >= 0.45 && customer.totalRefunds >= 2 && score >= 65;
+        return {
+            id: customer.id,
+            email: (0, maskCustomerIdentity_1.maskCustomerIdentity)(customer.email, "Customer profile"),
+            wardrobingScore: score,
+            refundRate: Number((customer.refundRate * 100).toFixed(1)),
+            totalRefunds: customer.totalRefunds,
+            totalOrders: customer.totalOrders,
+            likely,
+            confidence: Math.max(48, Math.min(95, score - 4 + reasons.length * 5)),
+            recommendedAction: likely
+                ? "Tighten refund exceptions"
+                : "Monitor repeat return behavior",
+            reasons,
+            automationPosture: likely
+                ? "Use score as a refund-review trigger"
+                : "Wait for one more repeat pattern before automating",
+        };
+    })
+        .filter((customer) => customer.wardrobingScore >= 45)
+        .sort((a, b) => b.wardrobingScore - a.wardrobingScore)
+        .slice(0, 5);
+    const highRiskCount = store.orders.filter((order) => order.fraudScore >= 71).length;
+    const manualReviewCount = store.orders.filter((order) => order.status === "manual_review").length;
+    const returnAbuseCount = store.customers.filter((customer) => customer.refundRate >= 0.35).length;
+    const chargebackCandidates = store.orders
+        .filter((order) => order.fraudScore >= 60 || order.refundRequested)
+        .filter((order) => !!(0, merchantLabels_1.getMerchantOrderLabelOrNull)(order))
+        .slice(0, 5)
+        .map((order) => ({
+        id: order.id,
+        shopifyOrderId: (0, merchantLabels_1.formatMerchantOrderLabel)(order),
+        chargebackRiskScore: Math.min(100, Math.round(order.fraudScore * 0.75 + (order.refundRequested ? 18 : 0))),
+        reasons: [
+            order.refundRequested
+                ? "Refund or post-purchase friction increases chargeback exposure."
+                : "Fraud score remains elevated for this order.",
+            order.status === "manual_review"
+                ? "Manual review indicates unresolved trust questions."
+                : `Current order status is ${order.status}.`,
+        ],
+    }));
+    const returnAbuseSignals = store.customers
+        .filter((customer) => customer.refundRate >= 0.25)
+        .slice(0, 5)
+        .map((customer) => ({
+        id: customer.id,
+        email: (0, maskCustomerIdentity_1.maskCustomerIdentity)(customer.email, "Customer profile"),
+        abuseScore: Math.min(100, Math.round(customer.refundRate * 75 + customer.totalRefunds * 6)),
+        reasons: [
+            `${customer.totalRefunds} refunds across ${customer.totalOrders} orders.`,
+            `${Number((customer.refundRate * 100).toFixed(1))}% refund rate recorded.`,
+        ],
+    }));
+    const automationReadiness = store.sharedFraudNetwork && highRiskCount >= 3
+        ? "Ready for stricter shared-network automations"
+        : store.sharedFraudNetwork
+            ? "Collecting enough network evidence for automation"
+            : "Enable shared network to unlock stronger automation coverage";
+    return {
+        summary: {
+            sharedFraudNetworkEnabled: store.sharedFraudNetwork,
+            networkMatches: networkMatches.length,
+            wardrobingSuspects: wardrobingSignals.filter((item) => item.likely).length,
+            highRiskOrders: highRiskCount,
+            manualReviewCount,
+            returnAbuseProfiles: returnAbuseCount,
+            automationReadiness,
+            chargebackCandidates: chargebackCandidates.length,
+        },
+        automationRules: [
+            {
+                id: "block_repeated_high_risk",
+                title: "Auto-block repeat high-risk fingerprints",
+                status: store.sharedFraudNetwork && networkMatches.some((item) => item.repeatSignals >= 3)
+                    ? "Ready"
+                    : "Warm-up",
+                detail: "Promote repeated shared-network matches into an automated block or manual-review rule once the pattern is stable.",
+            },
+            {
+                id: "wardrobe_refund_gate",
+                title: "Route likely wardrobing profiles into refund review",
+                status: wardrobingSignals.some((item) => item.likely) ? "Ready" : "Monitor",
+                detail: "Use wardrobing scores to require manual review before granting policy exceptions on repeat returners.",
+            },
+        ],
+        networkMatches,
+        wardrobingSignals,
+        chargebackCandidates,
+        returnAbuseSignals,
+        scoreBands: {
+            low: "0-30",
+            medium: "31-70",
+            high: "71-100",
+        },
     };
 }

@@ -17,14 +17,19 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ModuleGate } from "../../components/ModuleGate";
 import { useApiClient } from "../../api/client";
-import { EmptyPageState, LoadingPageState } from "../../components/PageState";
 import { useEmbeddedNavigation } from "../../hooks/useEmbeddedNavigation";
 import { useShopifyAdminLinks } from "../../hooks/useShopifyAdminLinks";
 import { useSubscriptionPlan } from "../../hooks/useSubscriptionPlan";
 import { readModuleCache, writeModuleCache } from "../../lib/moduleCache";
+import { withRequestTimeout } from "../../lib/requestTimeout";
 
 type WeeklyReport = {
   since: string;
+  setupState?: string;
+  readiness?: {
+    status: string;
+    reason: string;
+  };
   summary: {
     totalOrders: number;
     totalRevenue: number;
@@ -42,6 +47,11 @@ type WeeklyReport = {
   competitor: { intelligenceEvents: number };
   pricing: { suggestionsGenerated: number };
   profit: { opportunitiesIdentified: number };
+  sync?: {
+    latestStatus: string;
+    latestFinishedAt: string | null;
+    latestJobStatus?: string | null;
+  };
   trends: Array<{
     date: string;
     orders: number;
@@ -75,7 +85,64 @@ type WeeklyReport = {
     promotions: number;
     priceDelta: number;
   }>;
+  timelineHighlights?: Array<{
+    category: string;
+    eventType: string;
+    title: string;
+    detail: string;
+    severity: string;
+    occurredAt: string;
+  }>;
 };
+
+function buildFallbackReport(): WeeklyReport {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const today = new Date();
+  const trends = Array.from({ length: 7 }).map((_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (6 - index));
+    return {
+      date: date.toISOString().slice(0, 10),
+      orders: 0,
+      revenue: 0,
+      fraudHighRisk: 0,
+      refunds: 0,
+    };
+  });
+
+  return {
+    since,
+    setupState: "SYNC_REQUIRED",
+    readiness: {
+      status: "SYNC_REQUIRED",
+      reason: "Run the first live sync to generate a weekly report from persisted store data.",
+    },
+    summary: {
+      totalOrders: 0,
+      totalRevenue: 0,
+      totalRefunds: 0,
+      averageOrderValue: 0,
+    },
+    health: {
+      revenueTrend: "Awaiting first sync",
+      fraudPressure: "Awaiting first sync",
+      marketPressure: "Awaiting competitor data",
+      pricingMomentum: "Awaiting pricing data",
+    },
+    recommendations: [],
+    fraud: { highRiskOrders: 0 },
+    competitor: { intelligenceEvents: 0 },
+    pricing: { suggestionsGenerated: 0 },
+    profit: { opportunitiesIdentified: 0 },
+    sync: { latestStatus: "SYNC_REQUIRED", latestFinishedAt: null, latestJobStatus: null },
+    trends,
+    customers: { topRisky: [] },
+    pricingHighlights: [],
+    profitHighlights: [],
+    competitorHighlights: [],
+    timelineHighlights: [],
+  };
+}
 
 export function ReportsPage() {
   const api = useApiClient();
@@ -84,50 +151,33 @@ export function ReportsPage() {
   const [searchParams] = useSearchParams();
   const { subscription } = useSubscriptionPlan();
   const cachedReport = readModuleCache<WeeklyReport>("weekly-report");
-  const [report, setReport] = useState<WeeklyReport | null>(cachedReport ?? null);
+  const [report, setReport] = useState<WeeklyReport>(cachedReport ?? buildFallbackReport());
   const [loading, setLoading] = useState(!cachedReport);
   const [selectedTab, setSelectedTab] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
   const focus = searchParams.get("focus");
-  const reportsEnabled =
-    subscription?.planName === "TRIAL" ||
-    subscription?.planName === "GROWTH" ||
-    subscription?.planName === "PRO";
+  const reportsEnabled = !!subscription?.capabilities?.["reports.view"];
+  const reportState = report.readiness?.status ?? report.setupState ?? report.sync?.latestStatus ?? "SYNC_REQUIRED";
+  const reportReason =
+    report.readiness?.reason ??
+    (reportState === "READY_WITH_DATA"
+      ? "The report below is built from available store records and VedaSuite insights."
+      : "More store activity is needed before this report is ready for merchant decisions.");
 
   useEffect(() => {
-    api
-      .get<{ report: WeeklyReport }>("/api/reports/weekly")
+    setLoading(true);
+    withRequestTimeout(api.get<{ report: WeeklyReport }>("/api/reports/weekly"))
       .then((res) => {
         setReport(res.data.report);
         writeModuleCache("weekly-report", res.data.report);
       })
-      .catch(() => setReport(null))
+      .catch(() => setReport((current) => current ?? buildFallbackReport()))
       .finally(() => setLoading(false));
   }, [api]);
 
   useEffect(() => {
     setSelectedTab(focus === "highlights" ? 1 : 0);
   }, [focus]);
-
-  if (loading) {
-    return (
-      <LoadingPageState
-        title="Weekly Intelligence Reports"
-        subtitle="Preparing weekly brief..."
-        message="Loading fraud, competitor, pricing, and profit summaries."
-      />
-    );
-  }
-
-  if (!report) {
-    return (
-      <EmptyPageState
-        title="Weekly Intelligence Reports"
-        subtitle="No report available yet."
-        message="Weekly reports will appear here after enough activity is collected."
-      />
-    );
-  }
 
   const exportReport = async () => {
     try {
@@ -162,12 +212,33 @@ export function ReportsPage() {
         primaryAction={{ content: "Export report", onAction: exportReport }}
       >
         <Layout>
+          {loading ? (
+            <Layout.Section>
+              <Banner title="Refreshing weekly brief" tone="info">
+                <p>Report data is loading in the background.</p>
+              </Banner>
+            </Layout.Section>
+          ) : null}
           <Layout.Section>
-            <Banner title="Weekly report generated" tone="success">
-              <p>
-                The report below combines the core modules into a single merchant
-                decision brief.
-              </p>
+            <Banner
+              title={
+                reportState === "READY_WITH_DATA"
+                  ? "Weekly report generated from persisted store data"
+                  : reportState === "FAILED"
+                  ? "Weekly report needs attention"
+                  : reportState === "SYNC_COMPLETED_PROCESSING_PENDING"
+                  ? "Weekly report will appear as insights become available"
+                  : "Weekly report is waiting for real store data"
+              }
+              tone={
+                reportState === "READY_WITH_DATA"
+                  ? "success"
+                  : reportState === "FAILED"
+                  ? "critical"
+                  : "info"
+              }
+            >
+              <p>{reportReason}</p>
             </Banner>
           </Layout.Section>
           <Layout.Section>
@@ -178,17 +249,13 @@ export function ReportsPage() {
                     <Text as="h3" variant="headingMd">
                       Executive summary
                     </Text>
-                    <Badge tone="success">Ready to share</Badge>
+                    <Badge tone={report.sync?.latestStatus === "SUCCEEDED" ? "success" : "attention"}>
+                      {reportState === "READY_WITH_DATA" ? "Store data ready" : "Insights preparing"}
+                    </Badge>
                   </InlineStack>
                   <Text as="p" tone="subdued">
-                    One weekly brief keeps fraud, competitor moves, pricing actions,
-                    and profit opportunities aligned.
+                    {reportReason}
                   </Text>
-                  <div className="vs-analytics-strip" aria-hidden="true">
-                    {[44, 58, 63, 72, 68, 80].map((width, index) => (
-                      <span key={`report-strip-${index}`} style={{ width: `${width}%` }} />
-                    ))}
-                  </div>
                   <InlineGrid columns={{ xs: 1, sm: 3 }} gap="300">
                     <div className="vs-signal-stat">
                       <Text as="p" variant="bodySm" tone="subdued">
@@ -250,7 +317,19 @@ export function ReportsPage() {
                         {report.trends.map((point) => (
                           <span
                             key={point.date}
-                            style={{ width: `${Math.max(20, point.orders * 18)}%` }}
+                            style={{
+                              width: `${
+                            report.summary.totalOrders > 0
+                                  ? Math.max(
+                                      4,
+                                      Math.round(
+                                        (point.orders / Math.max(1, report.summary.totalOrders)) *
+                                          100
+                                      )
+                                    )
+                                  : 4
+                              }%`,
+                            }}
                           />
                         ))}
                       </div>
@@ -270,7 +349,7 @@ export function ReportsPage() {
                       <Text as="p" variant="bodySm" tone="subdued">
                         Revenue trend
                       </Text>
-                      <Badge tone="success">{report.health.revenueTrend}</Badge>
+                      <Badge tone={reportState === "READY_WITH_DATA" ? "success" : "info"}>{report.health.revenueTrend}</Badge>
                     </div>
                     <div className="vs-signal-stat">
                       <Text as="p" variant="bodySm" tone="subdued">
@@ -301,11 +380,11 @@ export function ReportsPage() {
                     Continue from report
                   </Text>
                   <Text as="p" tone="subdued">
-                    Jump into the exact module that needs attention this week.
+                    Jump into the exact workflow that needs attention this week.
                   </Text>
                   <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
                     <Button
-                      onClick={() => navigateEmbedded("/fraud?focus=high-risk")}
+                      onClick={() => navigateEmbedded("/trust-abuse?focus=high-risk")}
                     >
                       Open fraud review
                     </Button>
@@ -317,12 +396,12 @@ export function ReportsPage() {
                       Open competitor feed
                     </Button>
                     <Button
-                      onClick={() => navigateEmbedded("/pricing?focus=simulation")}
+                      onClick={() => navigateEmbedded("/pricing-profit?focus=simulation")}
                     >
                       Open pricing strategy
                     </Button>
                     <Button
-                      onClick={() => navigateEmbedded("/profit?focus=opportunities")}
+                      onClick={() => navigateEmbedded("/pricing-profit?focus=profit")}
                     >
                       Open profit engine
                     </Button>
@@ -411,58 +490,36 @@ export function ReportsPage() {
                       <Card>
                         <BlockStack gap="200">
                           <Text as="h3" variant="headingMd">
-                            Week in narrative
+                            Report status
                           </Text>
-                          <InlineGrid columns={{ xs: 1, md: 3 }} gap="300">
-                            <div className="vs-signal-stat">
-                              <Text as="p" variant="bodySm" tone="subdued">
-                                Early week
-                              </Text>
-                              <Text as="p">
-                                Fraud and customer-risk signals set the tone for the week.
-                              </Text>
-                            </div>
-                            <div className="vs-signal-stat">
-                              <Text as="p" variant="bodySm" tone="subdued">
-                                Mid week
-                              </Text>
-                              <Text as="p">
-                                Competitor signals and pricing movement determined response posture.
-                              </Text>
-                            </div>
-                            <div className="vs-signal-stat">
-                              <Text as="p" variant="bodySm" tone="subdued">
-                                End week
-                              </Text>
-                              <Text as="p">
-                                Margin and profit opportunities were prioritized for the next cycle.
-                              </Text>
-                            </div>
-                          </InlineGrid>
+                          <Text as="p" tone="subdued">
+                            {reportReason}
+                          </Text>
                         </BlockStack>
                       </Card>
                       <Card>
+                          <Text as="p">{report.recommendations[0] ?? reportReason}</Text>
+                      </Card>
+                      <Card>
                         <Text as="p">
-                          {report.recommendations[0]}
+                          {report.recommendations[1] ??
+                            "No second recommendation is available yet from persisted weekly report outputs."}
                         </Text>
                       </Card>
                       <Card>
                         <Text as="p">
-                          {report.recommendations[1]}
-                        </Text>
-                      </Card>
-                      <Card>
-                        <Text as="p">
-                          {report.recommendations[2]}
+                          {report.recommendations[2] ??
+                            "Additional report guidance appears after more store activity is available."}
                         </Text>
                       </Card>
                       <Card>
                         <InlineStack align="space-between" blockAlign="center">
                           <Text as="p">
-                            Report confidence remains high because all major suite
-                            signals were refreshed during the latest sync window.
+                            {reportReason}
                           </Text>
-                          <Badge tone="info">Confidence 91%</Badge>
+                          <Badge tone={reportState === "READY_WITH_DATA" ? "success" : "attention"}>
+                            {reportState === "READY_WITH_DATA" ? "Store data ready" : "Insights preparing"}
+                          </Badge>
                         </InlineStack>
                       </Card>
                       <Card>
@@ -470,7 +527,11 @@ export function ReportsPage() {
                           <Text as="h3" variant="headingMd">
                             Competitor momentum
                           </Text>
-                          {report.competitorHighlights.map((item) => (
+                          {report.competitorHighlights.length === 0 ? (
+                            <Text as="p" tone="subdued">
+                              No live competitor highlights are available yet.
+                            </Text>
+                          ) : report.competitorHighlights.map((item) => (
                             <InlineStack
                               key={item.productHandle}
                               align="space-between"
@@ -496,7 +557,11 @@ export function ReportsPage() {
                           <Text as="h3" variant="headingMd">
                             Highest-risk customers
                           </Text>
-                          {report.customers.topRisky.map((customer) => (
+                          {report.customers.topRisky.length === 0 ? (
+                            <Text as="p" tone="subdued">
+                              No high-risk customer profiles are available yet.
+                            </Text>
+                          ) : report.customers.topRisky.map((customer) => (
                             <InlineStack
                               key={`${customer.email ?? "unknown"}-${customer.creditScore}`}
                               align="space-between"
@@ -530,7 +595,11 @@ export function ReportsPage() {
                           <Text as="h3" variant="headingMd">
                             Pricing highlights
                           </Text>
-                          {report.pricingHighlights.map((item) => (
+                          {report.pricingHighlights.length === 0 ? (
+                            <Text as="p" tone="subdued">
+                              No live pricing highlights are available yet.
+                            </Text>
+                          ) : report.pricingHighlights.map((item) => (
                             <InlineStack
                               key={item.productHandle}
                               align="space-between"
@@ -562,7 +631,11 @@ export function ReportsPage() {
                           <Text as="h3" variant="headingMd">
                             Profit highlights
                           </Text>
-                          {report.profitHighlights.map((item) => (
+                          {report.profitHighlights.length === 0 ? (
+                            <Text as="p" tone="subdued">
+                              No live profit highlights are available yet.
+                            </Text>
+                          ) : report.profitHighlights.map((item) => (
                             <InlineStack
                               key={item.productHandle}
                               align="space-between"

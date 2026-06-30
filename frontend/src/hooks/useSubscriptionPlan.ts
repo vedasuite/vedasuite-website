@@ -1,25 +1,50 @@
 import { useContext } from "react";
 import { SubscriptionContext } from "../providers/SubscriptionProvider";
+import type {
+  BillingState,
+  BillingPlanName,
+  Capability,
+  CapabilityMap,
+  EntitlementState,
+  FeatureAccess,
+  ModuleAccess,
+  StarterModule,
+  SubscriptionInfo,
+  SubscriptionLifecycleStatus,
+} from "../lib/billingCapabilities";
+import { normalizeSubscriptionInfo } from "../lib/subscriptionState";
 
-export type SubscriptionInfo = {
-  planName: string;
-  price: number;
-  trialDays: number;
-  starterModule: "fraud" | "competitor" | null;
-  enabledModules: {
-    fraud: boolean;
-    competitor: boolean;
-    pricing: boolean;
-    creditScore: boolean;
-    profitOptimization: boolean;
-  };
+export type {
+  BillingState,
+  BillingPlanName,
+  Capability,
+  CapabilityMap,
+  EntitlementState,
+  FeatureAccess,
+  ModuleAccess,
+  StarterModule,
+  SubscriptionInfo,
+  SubscriptionLifecycleStatus,
 };
 
 export function useSubscriptionPlan() {
   const context = useContext(SubscriptionContext);
 
   if (!context) {
-    return { subscription: null, loading: true };
+    return {
+      subscription: null,
+      billingState: null,
+      entitlements: null,
+      loading: true,
+      refresh: async () => normalizeSubscriptionInfo(null),
+      billingFlowState: "IDLE" as const,
+      billingMessage: null,
+      billingError: null,
+      startBillingRedirect: () => undefined,
+      retryBillingConfirmation: async () => undefined,
+      dismissBillingMessage: () => undefined,
+      clearBillingError: () => undefined,
+    };
   }
 
   return context;

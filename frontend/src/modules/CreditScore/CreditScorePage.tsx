@@ -19,11 +19,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useApiClient } from "../../api/client";
 import { ModuleGate } from "../../components/ModuleGate";
-import { EmptyPageState, LoadingPageState } from "../../components/PageState";
 import { useEmbeddedNavigation } from "../../hooks/useEmbeddedNavigation";
 import { useShopifyAdminLinks } from "../../hooks/useShopifyAdminLinks";
 import { useSubscriptionPlan } from "../../hooks/useSubscriptionPlan";
 import { readModuleCache, writeModuleCache } from "../../lib/moduleCache";
+import { withRequestTimeout } from "../../lib/requestTimeout";
 
 type CustomerRow = {
   id: string;
@@ -37,6 +37,46 @@ type CustomerRow = {
   orderCompletionRate: number;
   creditScore: number;
   creditCategory: string;
+  confidence: number;
+  automationPosture: string;
+  reasons: string[];
+};
+
+type TrustOperatingLayer = {
+  segments: {
+    trusted: number;
+    normal: number;
+    risky: number;
+  };
+  policyRecommendations: Array<{
+    id: string;
+    title: string;
+    audience: string;
+    recommendation: string;
+    operationalAction: string;
+    automationMode: string;
+    confidence: number;
+  }>;
+  automationRules: Array<{
+    id: string;
+    title: string;
+    status: string;
+    detail: string;
+  }>;
+  priorityProfiles: Array<{
+    id: string;
+    email?: string | null;
+    shopifyCustomerId?: string | null;
+    creditScore: number;
+    creditCategory: string;
+    refundRate: number;
+    fraudSignalsCount: number;
+    paymentReliability: number;
+    operationalTag: string;
+    reasons: string[];
+    confidence: number;
+    automationPosture: string;
+  }>;
 };
 
 const resourceName = {
@@ -51,8 +91,12 @@ export function CreditScorePage() {
   const [searchParams] = useSearchParams();
   const { subscription, loading: subscriptionLoading } = useSubscriptionPlan();
   const cachedCustomers = readModuleCache<CustomerRow[]>("credit-customers");
+  const cachedOperatingLayer = readModuleCache<TrustOperatingLayer>("credit-operating-layer");
   const [customers, setCustomers] = useState<CustomerRow[]>(cachedCustomers ?? []);
-  const [loading, setLoading] = useState(!cachedCustomers);
+  const [operatingLayer, setOperatingLayer] = useState<TrustOperatingLayer | null>(
+    cachedOperatingLayer ?? null
+  );
+  const [loading, setLoading] = useState(false);
   const [selectedTab, setSelectedTab] = useState(0);
   const [activeCustomer, setActiveCustomer] = useState<CustomerRow | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -87,13 +131,25 @@ export function CreditScorePage() {
       : null;
 
   const loadCustomers = () => {
-    api
-      .get<{ customers: CustomerRow[] }>("/api/credit-score/customers")
-      .then((res) => {
-        setCustomers(res.data.customers);
-        writeModuleCache("credit-customers", res.data.customers);
+    Promise.all([
+      withRequestTimeout(api.get<{ customers: CustomerRow[] }>("/api/credit-score/customers")),
+      withRequestTimeout(api.get<{ operatingLayer: TrustOperatingLayer }>(
+        "/api/credit-score/operating-layer"
+      )),
+    ])
+      .then(([customersResponse, operatingLayerResponse]) => {
+        setCustomers(customersResponse.data.customers);
+        setOperatingLayer(operatingLayerResponse.data.operatingLayer);
+        writeModuleCache("credit-customers", customersResponse.data.customers);
+        writeModuleCache(
+          "credit-operating-layer",
+          operatingLayerResponse.data.operatingLayer
+        );
       })
-      .catch(() => setCustomers([]))
+      .catch(() => {
+        setCustomers([]);
+        setOperatingLayer(null);
+      })
       .finally(() => setLoading(false));
   };
 
@@ -114,16 +170,6 @@ export function CreditScorePage() {
 
     setSelectedTab(0);
   }, [focus]);
-
-  if (subscriptionLoading) {
-    return (
-      <LoadingPageState
-        title="Shopper Credit Score"
-        subtitle="Preparing customer trust data..."
-        message="Loading plan access and customer scoring."
-      />
-    );
-  }
 
   const recomputeScore = async () => {
     if (!activeCustomer) return;
@@ -151,26 +197,116 @@ export function CreditScorePage() {
       title="Shopper Credit Score"
       subtitle="See trust, refund behavior, and customer reliability at a glance."
       requiredPlan="Growth or Pro"
-      allowed={!!subscription?.enabledModules.creditScore}
+      allowed={!!subscription?.enabledModules?.creditScore}
     >
-      {loading ? (
-        <LoadingPageState
+      {filteredCustomers.length === 0 ? (
+        <Page
           title="Shopper Credit Score"
-          subtitle="Preparing customer trust data..."
-          message="Loading customer risk and credit insights."
-        />
-      ) : filteredCustomers.length === 0 ? (
-        <EmptyPageState
-          title="Shopper Credit Score"
-          subtitle="No customer credit data yet."
-          message="Customer scoring will appear here once shopper history is available."
-        />
+          subtitle="Trust, refund behavior, and reliability scoring for every shopper."
+        >
+          <Layout>
+            <Layout.Section>
+              <Banner title="Credit scoring is ready but store history is still light" tone="info">
+                <p>
+                  This module starts filling in after orders, refunds, and fraud signals
+                  are synced. Once customer history is available, VedaSuite will score
+                  each shopper and group them into trusted, normal, and risky segments.
+                </p>
+              </Banner>
+            </Layout.Section>
+            <Layout.Section>
+              <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Trusted Buyer
+                    </Text>
+                    <Text as="p" variant="heading2xl">
+                      80-100
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Low refund pressure, strong completion behavior, and stable payment reliability.
+                    </Text>
+                  </BlockStack>
+                </Card>
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Normal Buyer
+                    </Text>
+                    <Text as="p" variant="heading2xl">
+                      50-79
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Mixed behavior that usually needs standard merchant handling and periodic review.
+                    </Text>
+                  </BlockStack>
+                </Card>
+                <Card>
+                  <BlockStack gap="200">
+                    <Text as="h3" variant="headingMd">
+                      Risky Buyer
+                    </Text>
+                    <Text as="p" variant="heading2xl">
+                      0-49
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Higher refund risk, fraud pressure, or payment unreliability requiring closer review.
+                    </Text>
+                  </BlockStack>
+                </Card>
+              </InlineGrid>
+            </Layout.Section>
+            <Layout.Section>
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h3" variant="headingMd">
+                    What this module will show
+                  </Text>
+                  <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
+                    <div className="vs-signal-stat">
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Inputs
+                      </Text>
+                      <Text as="p">
+                        Refund frequency, completed orders, fraud signals, and payment reliability.
+                      </Text>
+                    </div>
+                    <div className="vs-signal-stat">
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Outputs
+                      </Text>
+                      <Text as="p">
+                        Shopper score, category, reasons, confidence, and operating recommendations.
+                      </Text>
+                    </div>
+                  </InlineGrid>
+                  <InlineStack gap="300">
+                    <Button onClick={() => navigateEmbedded("/trust-abuse")}>
+                      Open trust & abuse
+                    </Button>
+                    <Button onClick={() => navigateEmbedded("/reports")}>
+                      Open reports
+                    </Button>
+                  </InlineStack>
+                </BlockStack>
+              </Card>
+            </Layout.Section>
+          </Layout>
+        </Page>
       ) : (
         <Page
           title="Shopper Credit Score"
           subtitle="See trust, refund behavior, and customer reliability at a glance."
         >
       <Layout>
+        {subscriptionLoading || loading ? (
+          <Layout.Section>
+            <Banner title="Refreshing customer trust data" tone="info">
+              <p>Customer scores are loading in the background.</p>
+            </Banner>
+          </Layout.Section>
+        ) : null}
         <Layout.Section>
           <Banner title="Customer trust scoring is active" tone="info">
             <p>
@@ -186,6 +322,68 @@ export function CreditScorePage() {
             </Banner>
           </Layout.Section>
         ) : null}
+        <Layout.Section>
+          {operatingLayer ? (
+            <Card>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center">
+                  <div>
+                    <Text as="h3" variant="headingMd">
+                      Trust operating layer
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Use shopper trust as an operating rule across refunds, fraud review, and fulfillment.
+                    </Text>
+                  </div>
+                  <Badge tone="success">Operational</Badge>
+                </InlineStack>
+                <InlineGrid columns={{ xs: 1, md: 3 }} gap="300">
+                  {operatingLayer.policyRecommendations.map((policy) => (
+                    <Card key={policy.id}>
+                      <BlockStack gap="200">
+                        <Text as="h4" variant="headingSm">
+                          {policy.title}
+                        </Text>
+                        <Badge tone="info">{policy.audience}</Badge>
+                        <Text as="p" tone="subdued">
+                          {policy.recommendation}
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          {policy.operationalAction}
+                        </Text>
+                        <InlineStack align="space-between" blockAlign="center">
+                          <Text as="p" variant="bodySm" tone="subdued">
+                            {policy.automationMode}
+                          </Text>
+                          <Badge tone="success">{`${policy.confidence}% confidence`}</Badge>
+                        </InlineStack>
+                      </BlockStack>
+                    </Card>
+                  ))}
+                </InlineGrid>
+                <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
+                  {operatingLayer.automationRules.map((rule) => (
+                    <Card key={rule.id}>
+                      <BlockStack gap="200">
+                        <InlineStack align="space-between" blockAlign="center">
+                          <Text as="h4" variant="headingSm">
+                            {rule.title}
+                          </Text>
+                          <Badge tone={rule.status === "Ready" ? "success" : "attention"}>
+                            {rule.status}
+                          </Badge>
+                        </InlineStack>
+                        <Text as="p" tone="subdued">
+                          {rule.detail}
+                        </Text>
+                      </BlockStack>
+                    </Card>
+                  ))}
+                </InlineGrid>
+              </BlockStack>
+            </Card>
+          ) : null}
+        </Layout.Section>
         <Layout.Section>
           <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
             <Card>
@@ -279,6 +477,40 @@ export function CreditScorePage() {
             </Tabs>
           </Card>
         </Layout.Section>
+        {operatingLayer?.priorityProfiles?.length ? (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="h3" variant="headingMd">
+                    Priority trust profiles
+                  </Text>
+                  <Badge tone="attention">Actionable</Badge>
+                </InlineStack>
+                {operatingLayer.priorityProfiles.map((profile) => (
+                  <InlineStack
+                    key={profile.id}
+                    align="space-between"
+                    blockAlign="center"
+                  >
+                    <BlockStack gap="100">
+                      <Text as="p">{profile.email ?? "Unknown shopper"}</Text>
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {`${profile.creditCategory} | ${profile.refundRate}% refund rate | ${profile.fraudSignalsCount} fraud signals`}
+                      </Text>
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {`${profile.confidence}% confidence | ${profile.automationPosture}`}
+                      </Text>
+                    </BlockStack>
+                    <Badge tone={profile.creditScore < 50 ? "critical" : "success"}>
+                      {profile.operationalTag}
+                    </Badge>
+                  </InlineStack>
+                ))}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        ) : null}
       </Layout>
 
       <Modal
@@ -305,6 +537,9 @@ export function CreditScorePage() {
               <Text as="p">
                 Payment reliability: <strong>{activeCustomer.paymentReliability}/20</strong>
               </Text>
+              <Text as="p">
+                Confidence: <strong>{activeCustomer.confidence}%</strong>
+              </Text>
               <InlineStack gap="200">
                 <Badge tone="info">
                   {`${activeCustomer.totalOrders} completed orders`}
@@ -320,9 +555,19 @@ export function CreditScorePage() {
                 Recommendation: combine this shopper score with fraud review and
                 weekly reporting before changing fulfillment or refund policy.
               </Text>
+              <Text as="p" tone="subdued">
+                {activeCustomer.automationPosture}
+              </Text>
+              <BlockStack gap="100">
+                {activeCustomer.reasons.map((reason) => (
+                  <Text key={reason} as="p" variant="bodySm" tone="subdued">
+                    {reason}
+                  </Text>
+                ))}
+              </BlockStack>
               <InlineStack gap="300">
                 <Button
-                  onClick={() => navigateEmbedded("/fraud?focus=return-abuse")}
+                  onClick={() => navigateEmbedded("/trust-abuse?focus=return-abuse")}
                 >
                   Review fraud signals
                 </Button>

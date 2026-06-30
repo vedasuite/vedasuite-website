@@ -1,107 +1,440 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.normalizeCompetitorDomainInput = normalizeCompetitorDomainInput;
+exports.filterCompetitorSourceProducts = filterCompetitorSourceProducts;
+exports.deriveCompetitorPrimaryState = deriveCompetitorPrimaryState;
 exports.getCompetitorOverview = getCompetitorOverview;
 exports.listTrackedCompetitorProducts = listTrackedCompetitorProducts;
 exports.listCompetitorConnectors = listCompetitorConnectors;
 exports.updateCompetitorDomains = updateCompetitorDomains;
 exports.ingestCompetitorSnapshots = ingestCompetitorSnapshots;
+exports.getCompetitorResponseEngine = getCompetitorResponseEngine;
 const prismaClient_1 = require("../db/prismaClient");
 const shopifyAdminService_1 = require("./shopifyAdminService");
+const observabilityService_1 = require("./observabilityService");
+const storeOperationalStateService_1 = require("./storeOperationalStateService");
+const unifiedModuleStateService_1 = require("./unifiedModuleStateService");
+function normalizeCompetitorCatalogPrice(value) {
+    if (value == null) {
+        return null;
+    }
+    const parsed = Number(String(value).replace(/[^0-9.]/g, ""));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+async function fetchCompetitorCatalogProducts(domain, limit = 30) {
+    try {
+        return await (0, observabilityService_1.withRetry)(async () => {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            try {
+                const response = await fetch(`https://${domain}/products.json?limit=${Math.min(Math.max(limit, 1), 50)}`, {
+                    signal: controller.signal,
+                    headers: {
+                        "User-Agent": "VedaSuiteAI/1.0 competitor-catalog-analysis",
+                        Accept: "application/json",
+                    },
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = (await response.json());
+                return (payload.products ?? [])
+                    .map((product) => {
+                    const handle = product.handle?.trim();
+                    const title = product.title?.trim();
+                    if (!handle || !title) {
+                        return null;
+                    }
+                    const firstVariant = product.variants?.[0] ?? null;
+                    return {
+                        handle,
+                        title,
+                        url: `https://${domain}/products/${handle}`,
+                        price: normalizeCompetitorCatalogPrice(firstVariant?.price),
+                        available: typeof firstVariant?.available === "boolean"
+                            ? firstVariant.available
+                            : null,
+                    };
+                })
+                    .filter((product) => !!product)
+                    .slice(0, limit);
+            }
+            finally {
+                clearTimeout(timeout);
+            }
+        }, {
+            attempts: 2,
+            delayMs: 200,
+            operationName: "competitor.fetch_catalog",
+            context: { domain },
+        });
+    }
+    catch {
+        (0, observabilityService_1.logEvent)("warn", "competitor.catalog_fetch_failed", { domain });
+        return [];
+    }
+}
+const GIFT_CARD_PATTERN = /\bgift\s*card\b|\bgiftcard\b|\bgift[-\s]?voucher\b|\be[-\s]?gift\b/i;
+const LIVE_COMPETITOR_SOURCES = new Set(["website", "website_live", "website_catalog"]);
+const PRODUCT_TOKEN_STOPWORDS = new Set([
+    "and",
+    "the",
+    "for",
+    "with",
+    "from",
+    "product",
+    "shopify",
+    "online",
+    "store",
+    "men",
+    "women",
+    "unisex",
+]);
+function tokenizeProductText(value) {
+    return Array.from(new Set((value ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .split(" ")
+        .map((token) => token.trim())
+        .filter((token) => token.length >= 3 && !PRODUCT_TOKEN_STOPWORDS.has(token))));
+}
+function scoreCatalogProductMatch(sourceProduct, competitorProduct) {
+    const sourceTokens = tokenizeProductText(`${sourceProduct.title} ${sourceProduct.productHandle}`);
+    const competitorTokens = tokenizeProductText(`${competitorProduct.title} ${competitorProduct.handle}`);
+    if (sourceProduct.productHandle === competitorProduct.handle) {
+        return 100;
+    }
+    if (sourceTokens.length === 0 || competitorTokens.length === 0) {
+        return 0;
+    }
+    const competitorSet = new Set(competitorTokens);
+    const overlap = sourceTokens.filter((token) => competitorSet.has(token)).length;
+    const titleIncludes = competitorProduct.title.toLowerCase().includes(sourceProduct.title.toLowerCase()) ||
+        sourceProduct.title.toLowerCase().includes(competitorProduct.title.toLowerCase());
+    return Math.min(96, overlap * 24 +
+        (titleIncludes ? 28 : 0) +
+        (competitorProduct.price != null ? 10 : 0) +
+        (competitorProduct.available === false ? 4 : 0));
+}
+function findBestCatalogMatch(sourceProduct, catalogProducts) {
+    return catalogProducts
+        .map((product) => ({
+        product,
+        score: scoreCatalogProductMatch(sourceProduct, product),
+    }))
+        .sort((a, b) => b.score - a.score)[0] ?? null;
+}
+function normalizeCompetitorDomainInput(value) {
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed) {
+        return null;
+    }
+    const withoutProtocol = trimmed.replace(/^https?:\/\//, "");
+    const withoutAuth = withoutProtocol.replace(/^[^/@]+@/, "");
+    const host = withoutAuth.split(/[/?#\s]/)[0]?.replace(/^www\./, "") ?? "";
+    if (!host || host.includes("..") || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host)) {
+        return null;
+    }
+    return host;
+}
+function parseCompetitorMetadata(value) {
+    if (!value) {
+        return null;
+    }
+    try {
+        return JSON.parse(value);
+    }
+    catch {
+        return null;
+    }
+}
+function normalizeCompetitorMetadata(row) {
+    const parsed = parseCompetitorMetadata(row.insightsJson);
+    if (parsed) {
+        return parsed;
+    }
+    const confidenceScore = row.price != null
+        ? 82
+        : row.promotion || row.stockStatus === "low_stock" || row.stockStatus === "out_of_stock"
+            ? 58
+            : 42;
+    return {
+        confidenceScore,
+        confidenceLabel: confidenceScore >= 80 ? "high" : confidenceScore >= 60 ? "medium" : "low",
+        matchReason: confidenceScore >= 80
+            ? "Live competitor pricing was captured for this product."
+            : confidenceScore >= 60
+                ? "The product page matched, but only part of the live pricing signal could be confirmed."
+                : "The match relied on weak page signals and is excluded from comparable-product reporting.",
+        usedFallbackPrice: confidenceScore < 80,
+    };
+}
+function filterCompetitorSourceProducts(products) {
+    const excluded = {
+        archived: 0,
+        draft: 0,
+        giftCardLike: 0,
+        missingPrice: 0,
+    };
+    const eligible = products.filter((product) => {
+        const status = (product.status ?? "").toLowerCase();
+        if (status === "archived") {
+            excluded.archived += 1;
+            return false;
+        }
+        if (status === "draft") {
+            excluded.draft += 1;
+            return false;
+        }
+        if (GIFT_CARD_PATTERN.test(product.title)) {
+            excluded.giftCardLike += 1;
+            return false;
+        }
+        if (product.currentPrice == null || product.currentPrice <= 0) {
+            excluded.missingPrice += 1;
+            return false;
+        }
+        return true;
+    });
+    return {
+        eligible,
+        excluded,
+        excludedCount: excluded.archived + excluded.draft + excluded.giftCardLike + excluded.missingPrice,
+    };
+}
+function filterComparableRows(rows) {
+    const productionRows = rows.filter((row) => LIVE_COMPETITOR_SOURCES.has(row.source));
+    const deduped = new Map();
+    const lowConfidenceRows = [];
+    const excludedDuplicates = [];
+    for (const row of productionRows) {
+        const metadata = normalizeCompetitorMetadata(row);
+        if (metadata.confidenceScore < 60) {
+            lowConfidenceRows.push(row);
+            continue;
+        }
+        const key = `${row.productHandle}::${row.competitorName}::${row.source}`;
+        if (deduped.has(key)) {
+            excludedDuplicates.push(row);
+            continue;
+        }
+        deduped.set(key, row);
+    }
+    const comparableRows = Array.from(deduped.values());
+    return {
+        comparableRows,
+        lowConfidenceRows,
+        excludedDuplicates,
+        validMatchedProductsCount: new Set(comparableRows.map((row) => row.productHandle)).size,
+        lowConfidenceProductsCount: new Set(lowConfidenceRows.map((row) => row.productHandle)).size,
+    };
+}
+function getCompetitorFreshnessLabel(freshnessHours, lastSuccessfulRunAt) {
+    if (!lastSuccessfulRunAt) {
+        return "Awaiting first successful refresh";
+    }
+    if (freshnessHours == null) {
+        return "Refresh time unavailable";
+    }
+    if (freshnessHours <= 1) {
+        return "Refreshed recently";
+    }
+    if (freshnessHours < 24) {
+        return `Last refreshed ${Math.round(freshnessHours)} hour${Math.round(freshnessHours) === 1 ? "" : "s"} ago`;
+    }
+    const freshnessDays = Number((freshnessHours / 24).toFixed(1));
+    if (freshnessDays < 7) {
+        return `Last refreshed ${freshnessDays} day${freshnessDays === 1 ? "" : "s"} ago`;
+    }
+    const freshnessWeeks = Number((freshnessDays / 7).toFixed(1));
+    return `Last refreshed ${freshnessWeeks} week${freshnessWeeks === 1 ? "" : "s"} ago`;
+}
+function deriveCompetitorPrimaryState(args) {
+    if (!args.hasDomains) {
+        return "SETUP_INCOMPLETE";
+    }
+    if (args.syncStatusLabel === "FAILED") {
+        return "FAILURE";
+    }
+    if (!args.lastSuccessfulRunAt) {
+        return "AWAITING_FIRST_RUN";
+    }
+    if (args.freshnessHours != null && args.freshnessHours > 24) {
+        return "STALE";
+    }
+    if (args.validMatchedProductsCount === 0 && args.lowConfidenceProductsCount > 0) {
+        return "LOW_CONFIDENCE";
+    }
+    if (args.validMatchedProductsCount === 0) {
+        return "NO_MATCHES";
+    }
+    if (!args.changesDetected) {
+        return "NO_CHANGES";
+    }
+    return "CHANGES_DETECTED";
+}
+function getCompetitorPrimaryStateCopy(args) {
+    switch (args.primaryState) {
+        case "SETUP_INCOMPLETE":
+            return {
+                title: "Add competitor websites to begin analysis",
+                description: "Add competitor websites to begin tracking pricing and product trends.",
+                nextAction: "Add competitor websites",
+                coverageStatus: "Add competitor websites",
+                toastMessage: "Add competitor websites before running competitor analysis.",
+            };
+        case "AWAITING_FIRST_RUN":
+            return {
+                title: "Competitor websites are ready",
+                description: "Run the first competitor analysis to compare selected websites with your catalog.",
+                nextAction: "Run competitor analysis",
+                coverageStatus: "Ready for first analysis",
+                toastMessage: "Competitor analysis started.",
+            };
+        case "NO_MATCHES":
+            return {
+                title: "Competitor analysis completed",
+                description: "Competitor analysis completed. No matching products were identified yet.",
+                nextAction: "Review tracked products or add more competitor websites",
+                coverageStatus: "No matching products yet",
+                toastMessage: "Competitor analysis completed. No matching products were identified yet.",
+            };
+        case "LOW_CONFIDENCE":
+            return {
+                title: "Possible competitor matches need review",
+                description: "VedaSuite found possible competitor pages, but the captured signals were too weak to treat them as reliable comparable products.",
+                nextAction: "Review websites, product overlap, or run another analysis",
+                coverageStatus: "Low-confidence matches only",
+                toastMessage: "Analysis completed. Possible competitor matches were found, but they need stronger evidence.",
+            };
+        case "NO_CHANGES":
+            return {
+                title: "Competitor analysis is active",
+                description: "Comparable products were reviewed successfully. No new price, promotion, or stock changes need attention.",
+                nextAction: "Review tracked products or run analysis again later",
+                coverageStatus: "Healthy with no changes",
+                toastMessage: "Competitor analysis completed. No changes need attention.",
+            };
+        case "CHANGES_DETECTED":
+            return {
+                title: "Competitor changes were detected across matched products",
+                description: `The latest analysis reviewed ${args.checkedDomainsCount} websites, matched ${args.validMatchedProductsCount} comparable products, and found ${args.changesDetected} competitor changes.`,
+                nextAction: "View changes",
+                coverageStatus: "Changes detected",
+                toastMessage: "Competitor analysis completed. New competitor changes were detected.",
+            };
+        case "STALE":
+            return {
+                title: "Competitor analysis has not been updated recently",
+                description: `Run a new analysis to review the latest competitor pricing and product trends. ${args.freshnessLabel}.`,
+                nextAction: "Update competitor analysis",
+                coverageStatus: "Update recommended",
+                toastMessage: "Competitor analysis has not been updated recently.",
+            };
+        case "FAILURE":
+        default:
+            return {
+                title: "Competitor analysis needs attention",
+                description: args.latestError ??
+                    "VedaSuite could not complete the latest competitor analysis.",
+                nextAction: "Try again",
+                coverageStatus: "Needs attention",
+                toastMessage: "Competitor analysis could not be completed. Please try again.",
+            };
+    }
+}
 function normalizeCompetitorName(domain, label) {
     return label ?? domain.replace(/\..+$/, "").replace(/[-_]/g, " ");
 }
-function buildGoogleShoppingSignal(domain, productHandle, basePrice, competitorName) {
-    const priceShift = ((domain.length + productHandle.length) % 5) - 2;
-    const price = Number(Math.max(1, basePrice + priceShift * 0.75).toFixed(2));
-    const promotion = price < basePrice ? "Google Shopping price dip" : null;
-    return {
-        source: "google_shopping",
-        price,
-        promotion,
-        stockStatus: "in_stock",
-        competitorUrl: `https://www.google.com/search?tbm=shop&q=${encodeURIComponent(`${competitorName} ${productHandle}`)}`,
-        insightsJson: JSON.stringify({
-            ingestionSource: "google-shopping-signal",
-            marketSurface: "Google Shopping",
-            capturedAt: new Date().toISOString(),
-            priceDelta: Number((price - basePrice).toFixed(2)),
-        }),
-    };
+function formatSourceLabel(source) {
+    if (source === "google_shopping")
+        return "Google Shopping beta";
+    if (source === "meta_ads")
+        return "Ad-library beta";
+    if (source.startsWith("website"))
+        return "Competitor website";
+    return source;
 }
-function buildMetaAdSignal(domain, productHandle, basePrice, competitorName) {
-    const promoTrigger = (domain.length + productHandle.length) % 3 === 0;
-    const promotion = promoTrigger ? "Meta campaign promo detected" : null;
-    const adCopy = promoTrigger
-        ? `${competitorName} is pushing ${productHandle} with an urgency-led promotional message.`
-        : `${competitorName} is running visibility ads for ${productHandle}.`;
-    return {
-        source: "meta_ads",
-        price: basePrice,
-        promotion,
-        stockStatus: promoTrigger ? "low_stock" : "in_stock",
-        adCopy,
-        competitorUrl: `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&media_type=all&search_type=keyword_unordered&view_all_page_id=0&q=${encodeURIComponent(`${competitorName} ${productHandle}`)}`,
-        insightsJson: JSON.stringify({
-            ingestionSource: "meta-ads-signal",
-            marketSurface: "Meta Ad Library",
-            capturedAt: new Date().toISOString(),
-            adPressure: promoTrigger ? "high" : "medium",
-        }),
-    };
+function inferMoveType(row) {
+    if (row.stockStatus === "out_of_stock")
+        return "Stock outage";
+    if (row.stockStatus === "low_stock")
+        return "Stock pressure";
+    if (row.promotion)
+        return "Promotion change";
+    if (row.source === "meta_ads" || row.adCopy)
+        return "Beta ad-library signal";
+    if (row.source === "google_shopping")
+        return "Beta shopping signal";
+    if (row.price != null)
+        return "Price move";
+    return "Market signal";
 }
-async function getCompetitorOverview(shopDomain) {
+function scorePriority(impactScore) {
+    if (impactScore >= 75)
+        return "High";
+    if (impactScore >= 45)
+        return "Medium";
+    return "Low";
+}
+function inferSuggestedAction(args) {
+    if (args.stockStatus === "out_of_stock")
+        return "Promote availability and hold price";
+    if (args.stockStatus === "low_stock")
+        return "Monitor stock pressure before discounting";
+    if (args.promotion)
+        return "Review bundle or selective response";
+    if (args.source === "meta_ads")
+        return "Review beta ad-library signal";
+    if (args.priceDelta <= -2)
+        return "Review hero SKU pricing";
+    if (args.priceDelta >= 2)
+        return "Hold price and protect margin";
+    return "Wait and monitor";
+}
+function inferActionWindow(priority) {
+    if (priority === "High")
+        return "Today";
+    if (priority === "Medium")
+        return "This week";
+    return "Monitor";
+}
+async function getStore(shopDomain) {
     const store = await prismaClient_1.prisma.store.findUnique({
         where: { shop: shopDomain },
+        include: {
+            competitorDomains: true,
+            productSnapshots: {
+                select: {
+                    handle: true,
+                    title: true,
+                    status: true,
+                    currentPrice: true,
+                },
+            },
+        },
     });
-    if (!store)
+    if (!store) {
         throw new Error("Store not found");
-    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const last72h = new Date(Date.now() - 72 * 60 * 60 * 1000);
-    const [recentChanges, promoCount, stockAlerts, domains, recentRows, allRows,] = await Promise.all([
-        prismaClient_1.prisma.competitorData.count({
-            where: { storeId: store.id, collectedAt: { gte: last24h } },
-        }),
-        prismaClient_1.prisma.competitorData.count({
-            where: {
-                storeId: store.id,
-                promotion: { not: null },
-                collectedAt: { gte: last24h },
-            },
-        }),
-        prismaClient_1.prisma.competitorData.count({
-            where: {
-                storeId: store.id,
-                stockStatus: { in: ["out_of_stock", "low_stock"] },
-                collectedAt: { gte: last24h },
-            },
-        }),
-        prismaClient_1.prisma.competitorDomain.count({
-            where: { storeId: store.id },
-        }),
-        prismaClient_1.prisma.competitorData.findMany({
-            where: { storeId: store.id, collectedAt: { gte: last72h } },
-            orderBy: { collectedAt: "desc" },
-            take: 150,
-        }),
-        prismaClient_1.prisma.competitorData.findMany({
-            where: { storeId: store.id },
-            orderBy: { collectedAt: "desc" },
-            take: 500,
-        }),
-    ]);
-    const sourceBreakdown = {
-        website: recentRows.filter((row) => row.source.startsWith("website")).length,
-        googleShopping: recentRows.filter((row) => row.source === "google_shopping")
-            .length,
-        metaAds: recentRows.filter((row) => row.source === "meta_ads").length,
-    };
+    }
+    return store;
+}
+async function getCompetitorRows(storeId, limit = 500) {
+    return prismaClient_1.prisma.competitorData.findMany({
+        where: { storeId },
+        orderBy: { collectedAt: "desc" },
+        take: limit,
+    });
+}
+function buildProductSignals(rows) {
     const productSignals = new Map();
-    for (const row of [...recentRows].reverse()) {
+    for (const row of [...rows].reverse()) {
         const bucket = productSignals.get(row.productHandle) ?? {
             latest: null,
             earliest: null,
             promotions: 0,
             stock: 0,
+            sources: new Set(),
         };
         if (bucket.earliest == null && row.price != null) {
             bucket.earliest = row.price;
@@ -109,14 +442,121 @@ async function getCompetitorOverview(shopDomain) {
         if (row.price != null) {
             bucket.latest = row.price;
         }
-        if (row.promotion) {
+        if (row.promotion)
             bucket.promotions += 1;
-        }
         if (row.stockStatus === "low_stock" || row.stockStatus === "out_of_stock") {
             bucket.stock += 1;
         }
+        bucket.sources.add(row.source);
         productSignals.set(row.productHandle, bucket);
     }
+    return productSignals;
+}
+function buildStrategyDetections(rows) {
+    const promotionCount = rows.filter((row) => !!row.promotion).length;
+    const stockAlerts = rows.filter((row) => row.stockStatus === "low_stock" || row.stockStatus === "out_of_stock").length;
+    const adPressure = rows.filter((row) => row.source === "meta_ads" || !!row.adCopy).length;
+    const priceRows = rows.filter((row) => row.price != null);
+    const averagePrice = priceRows.length
+        ? priceRows.reduce((sum, row) => sum + (row.price ?? 0), 0) / priceRows.length
+        : 0;
+    const detections = [];
+    if (promotionCount >= 4) {
+        detections.push({
+            strategy: "Promotion-led push",
+            signalStrength: promotionCount >= 8 ? "Strong" : "Moderate",
+            why: "Repeated live promotion signals are appearing across the monitored competitor set.",
+            implication: "The competitor may be trying to improve short-term conversion or move inventory.",
+            recommendedMove: "Use selective offers or bundles instead of broad matching discounts.",
+        });
+    }
+    if (stockAlerts >= 3) {
+        detections.push({
+            strategy: "Inventory pressure",
+            signalStrength: stockAlerts >= 6 ? "Strong" : "Moderate",
+            why: "Low-stock and out-of-stock signals are clustering in the latest competitor analysis.",
+            implication: "Pressure may ease without a broad pricing response if the competitor is supply constrained.",
+            recommendedMove: "Hold price on hero SKUs and watch availability before reacting.",
+        });
+    }
+    if (adPressure >= 3) {
+        detections.push({
+            strategy: "Visibility push",
+            signalStrength: adPressure >= 6 ? "Strong" : "Moderate",
+            why: "Live ad-pressure signals suggest the competitor is increasing visibility.",
+            implication: "Merchants may need stronger merchandising or promotional positioning rather than immediate repricing.",
+            recommendedMove: "Promote differentiated value props and monitor conversion on exposed SKUs.",
+        });
+    }
+    if (averagePrice > 0 && promotionCount === 0 && stockAlerts === 0 && adPressure === 0) {
+        detections.push({
+            strategy: "Price watch only",
+            signalStrength: "Early",
+            why: "Current competitor coverage is mostly pricing-only and does not yet suggest a larger strategy pattern.",
+            implication: "Continue analysis until promotion, stock, or ad signals strengthen the picture.",
+            recommendedMove: "Wait and monitor rather than making a reactive pricing change.",
+        });
+    }
+    return detections.slice(0, 4);
+}
+async function getCompetitorOverview(shopDomain) {
+    const [store, operational] = await Promise.all([
+        getStore(shopDomain),
+        (0, storeOperationalStateService_1.getStoreOperationalSnapshot)(shopDomain),
+    ]);
+    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const last72h = new Date(Date.now() - 72 * 60 * 60 * 1000);
+    const [recentRows, allRows, latestSyncJob] = await Promise.all([
+        prismaClient_1.prisma.competitorData.findMany({
+            where: { storeId: store.id, collectedAt: { gte: last72h } },
+            orderBy: { collectedAt: "desc" },
+            take: 150,
+        }),
+        getCompetitorRows(store.id),
+        prismaClient_1.prisma.syncJob.findFirst({
+            where: { storeId: store.id },
+            orderBy: { createdAt: "desc" },
+        }),
+    ]);
+    const latestCompetitorJob = operational.latestCompetitorIngestJob;
+    const latestCompetitorSummary = latestCompetitorJob?.summaryJson
+        ? (() => {
+            try {
+                return JSON.parse(latestCompetitorJob.summaryJson);
+            }
+            catch {
+                return null;
+            }
+        })()
+        : null;
+    const syncState = (0, storeOperationalStateService_1.deriveSyncStatus)({
+        connectionStatus: operational.store.lastConnectionStatus,
+        latestSyncJobStatus: operational.latestSyncJob?.status ?? null,
+        lastSyncStatus: operational.store.lastSyncStatus,
+        products: operational.counts.products,
+        orders: operational.counts.orders,
+        customers: operational.counts.customers,
+        priceRows: operational.counts.pricingRows,
+        profitRows: operational.counts.profitRows,
+        timelineEvents: operational.counts.timelineEvents,
+    });
+    const eligibleProducts = filterCompetitorSourceProducts(store.productSnapshots.map((product) => ({
+        productHandle: product.handle,
+        title: product.title,
+        status: product.status,
+        currentPrice: product.currentPrice ?? null,
+    })));
+    const comparableRecentRows = filterComparableRows(recentRows);
+    const comparableAllRows = filterComparableRows(allRows);
+    const sourceBreakdown = {
+        website: comparableRecentRows.comparableRows.filter((row) => row.source.startsWith("website")).length,
+        googleShopping: comparableRecentRows.comparableRows.filter((row) => row.source === "google_shopping").length,
+        metaAds: comparableRecentRows.comparableRows.filter((row) => row.source === "meta_ads").length,
+    };
+    const promoCount = comparableRecentRows.comparableRows.filter((row) => !!row.promotion).length;
+    const stockAlerts = comparableRecentRows.comparableRows.filter((row) => row.stockStatus === "low_stock" || row.stockStatus === "out_of_stock").length;
+    const recentChanges = comparableRecentRows.comparableRows.filter((row) => row.collectedAt >= last24h).length;
+    const productSignals = buildProductSignals(comparableRecentRows.comparableRows);
     const topMovers = Array.from(productSignals.entries())
         .map(([productHandle, bucket]) => ({
         productHandle,
@@ -129,53 +569,633 @@ async function getCompetitorOverview(shopDomain) {
         .sort((a, b) => Math.abs(b.priceDelta) - Math.abs(a.priceDelta) ||
         b.promotionSignals - a.promotionSignals)
         .slice(0, 5);
-    const lastIngestedAt = allRows[0]?.collectedAt ?? null;
-    const freshnessHours = lastIngestedAt
-        ? Number(((Date.now() - new Date(lastIngestedAt).getTime()) / (1000 * 60 * 60)).toFixed(1))
+    const moveFeed = comparableRecentRows.comparableRows.slice(0, 10).map((row) => {
+        const bucket = productSignals.get(row.productHandle);
+        const priceDelta = bucket?.latest != null && bucket?.earliest != null
+            ? Number((bucket.latest - bucket.earliest).toFixed(2))
+            : 0;
+        const impactScore = Math.max(12, Math.min(96, Math.round(Math.abs(priceDelta) * 16 +
+            (row.promotion ? 22 : 0) +
+            (row.stockStatus === "out_of_stock"
+                ? 28
+                : row.stockStatus === "low_stock"
+                    ? 16
+                    : 0) +
+            (row.source === "meta_ads" ? 14 : row.source === "google_shopping" ? 10 : 8))));
+        const priority = scorePriority(impactScore);
+        return {
+            id: row.id,
+            headline: `${row.competitorName} changed ${row.productHandle}`,
+            moveType: inferMoveType(row),
+            source: formatSourceLabel(row.source),
+            priority,
+            impactScore,
+            actionWindow: inferActionWindow(priority),
+            eventCluster: row.promotion || row.adCopy
+                ? "Promotion and visibility"
+                : row.stockStatus === "out_of_stock" || row.stockStatus === "low_stock"
+                    ? "Inventory and availability"
+                    : "Pricing and market posture",
+            whyItMatters: row.promotion ??
+                row.adCopy ??
+                (row.stockStatus
+                    ? `Stock posture is now ${row.stockStatus.replace(/_/g, " ")}.`
+                    : priceDelta !== 0
+                        ? `Observed competitor price movement of ${priceDelta >= 0 ? "+" : "-"}$${Math.abs(priceDelta).toFixed(2)}.`
+                        : "A fresh competitor signal was detected for this SKU."),
+            suggestedAction: inferSuggestedAction({
+                priceDelta,
+                promotion: row.promotion,
+                stockStatus: row.stockStatus,
+                source: row.source,
+            }),
+            collectedAt: row.collectedAt,
+        };
+    });
+    const actionSuggestions = topMovers.slice(0, 4).map((mover) => ({
+        productHandle: mover.productHandle,
+        suggestion: mover.promotionSignals >= 2
+            ? "Bundle or selectively match"
+            : mover.priceDelta <= -2
+                ? "Review hero SKU pricing"
+                : mover.stockSignals > 0
+                    ? "Hold margin and monitor"
+                    : "Wait and monitor",
+        why: mover.promotionSignals >= 2
+            ? "Promotions are clustering around this SKU."
+            : mover.priceDelta <= -2
+                ? "Competitor pricing dropped enough to affect conversion risk."
+                : mover.stockSignals > 0
+                    ? "Competitor stock posture may ease pressure without immediate discounting."
+                    : "Current movement does not yet justify a reactive pricing change.",
+        urgency: mover.promotionSignals >= 2 || Math.abs(mover.priceDelta) >= 2
+            ? "Act this week"
+            : "Monitor",
+        expectedOutcome: mover.promotionSignals >= 2
+            ? "Protect conversion without broad margin erosion."
+            : mover.priceDelta <= -2
+                ? "Reduce demand leakage on exposed SKUs."
+                : mover.stockSignals > 0
+                    ? "Preserve margin while the competitor availability story develops."
+                    : "Avoid unnecessary reactions and preserve pricing discipline.",
+    }));
+    const strategyDetections = buildStrategyDetections(comparableRecentRows.comparableRows);
+    const lastIngestedAt = comparableAllRows.comparableRows[0]?.collectedAt ?? allRows[0]?.collectedAt ?? null;
+    const lastSuccessAt = latestCompetitorJob &&
+        (latestCompetitorJob.status === "SUCCEEDED" ||
+            latestCompetitorJob.status === "SUCCEEDED_NO_DATA")
+        ? latestCompetitorJob.finishedAt ?? null
+        : lastIngestedAt;
+    const lastAttemptAt = latestCompetitorJob?.finishedAt ??
+        latestCompetitorJob?.startedAt ??
+        null;
+    const freshnessHours = lastSuccessAt
+        ? Number(((Date.now() - new Date(lastSuccessAt).getTime()) / (1000 * 60 * 60)).toFixed(1))
         : null;
-    const promotionalHeat = promoCount >= 15 ? "High" : promoCount >= 7 ? "Medium" : "Low";
-    const marketPressure = recentChanges >= 24 ? "High" : recentChanges >= 10 ? "Medium" : "Low";
+    const checkedDomainsCount = store.competitorDomains.length === 0
+        ? 0
+        : latestCompetitorSummary?.domains ?? store.competitorDomains.length;
+    const monitoredProductsCount = Math.max(latestCompetitorSummary?.products ?? 0, eligibleProducts.eligible.length, comparableRecentRows.validMatchedProductsCount);
+    const matchedProductsCount = comparableRecentRows.validMatchedProductsCount;
+    const lowConfidenceMatchesCount = comparableRecentRows.lowConfidenceProductsCount;
+    const detectedPriceChangesCount = topMovers.filter((item) => item.priceDelta !== 0).length;
+    const detectedPromotionChangesCount = promoCount;
+    const setupStatus = store.competitorDomains.length === 0
+        ? "NO_DOMAINS"
+        : monitoredProductsCount === 0
+            ? "NO_MONITORED_PRODUCTS"
+            : "READY";
+    const syncStatusLabel = latestCompetitorJob?.status === "RUNNING"
+        ? "RUNNING"
+        : latestCompetitorJob?.status === "FAILED"
+            ? "FAILED"
+            : latestCompetitorJob?.status === "SUCCEEDED_NO_DATA"
+                ? "SUCCEEDED_NO_DATA"
+                : latestCompetitorJob?.status === "SUCCEEDED"
+                    ? "SUCCEEDED"
+                    : "NOT_STARTED";
+    const crawlStatus = syncStatusLabel === "RUNNING"
+        ? "RUNNING"
+        : syncStatusLabel === "FAILED"
+            ? "FAILED"
+            : syncStatusLabel === "NOT_STARTED"
+                ? "NOT_STARTED"
+                : latestCompetitorSummary?.skipped && latestCompetitorSummary.skipped > 0 && (latestCompetitorSummary.ingested ?? 0) > 0
+                    ? "PARTIAL"
+                    : syncStatusLabel === "SUCCEEDED" || syncStatusLabel === "SUCCEEDED_NO_DATA"
+                        ? "SUCCEEDED"
+                        : "NOT_STARTED";
+    const freshnessStatus = freshnessHours == null ? "UNKNOWN" : freshnessHours > 24 ? "STALE" : "FRESH";
+    const snapshotStatus = syncStatusLabel === "FAILED"
+        ? "FAILED"
+        : setupStatus !== "READY"
+            ? "NOT_STARTED"
+            : syncStatusLabel === "RUNNING"
+                ? "NOT_STARTED"
+                : monitoredProductsCount === 0
+                    ? "NOT_STARTED"
+                    : matchedProductsCount === 0 && lowConfidenceMatchesCount === 0
+                        ? "NO_MATCHES"
+                        : matchedProductsCount === 0 && lowConfidenceMatchesCount > 0
+                            ? "PARTIAL"
+                            : detectedPriceChangesCount === 0 && detectedPromotionChangesCount === 0
+                                ? "NO_CHANGES"
+                                : crawlStatus === "PARTIAL"
+                                    ? "PARTIAL"
+                                    : "READY";
+    const freshnessFailureReason = freshnessHours != null && freshnessHours > 72
+        ? `Competitor analysis has not been updated recently. The last successful analysis was ${getCompetitorFreshnessLabel(freshnessHours, lastSuccessAt).toLowerCase()}.`
+        : operational.latestCompetitorIngestJob?.status === "FAILED"
+            ? operational.latestCompetitorIngestJob.errorMessage ??
+                "The latest competitor ingestion failed."
+            : operational.store.lastConnectionError;
+    const readiness = (0, storeOperationalStateService_1.deriveModuleReadiness)({
+        syncStatus: operational.latestCompetitorIngestJob?.status === "FAILED"
+            ? "FAILED"
+            : syncState.status === "READY_WITH_DATA" &&
+                operational.counts.competitorDomains > 0 &&
+                operational.counts.competitorRows === 0
+                ? "SYNC_COMPLETED_PROCESSING_PENDING"
+                : syncState.status,
+        rawCount: operational.counts.competitorDomains,
+        processedCount: operational.counts.competitorRows,
+        lastUpdatedAt: operational.latestCompetitorAt,
+        failureReason: freshnessFailureReason,
+    });
+    const competitorDependencyState = operational.counts.competitorRows > 0 ? "ready" : "missing";
+    const pricingDependencyState = operational.counts.pricingRows > 0 ? "ready" : "missing";
+    const fraudDependencyState = operational.counts.timelineEvents > 0 ? "ready" : "missing";
+    const changesDetected = detectedPriceChangesCount +
+        detectedPromotionChangesCount +
+        stockAlerts;
+    const freshnessLabel = getCompetitorFreshnessLabel(freshnessHours, lastSuccessAt);
+    const primaryState = deriveCompetitorPrimaryState({
+        hasDomains: store.competitorDomains.length > 0,
+        syncStatusLabel,
+        lastSuccessfulRunAt: lastSuccessAt,
+        freshnessHours,
+        validMatchedProductsCount: matchedProductsCount,
+        lowConfidenceProductsCount: lowConfidenceMatchesCount,
+        changesDetected: changesDetected > 0,
+    });
+    const primaryStateCopy = getCompetitorPrimaryStateCopy({
+        primaryState,
+        freshnessLabel,
+        validMatchedProductsCount: matchedProductsCount,
+        lowConfidenceProductsCount: lowConfidenceMatchesCount,
+        checkedDomainsCount,
+        changesDetected,
+        latestError: latestCompetitorJob?.errorMessage ??
+            latestCompetitorSummary?.reason ??
+            null,
+        lastSuccessfulRunAt: lastSuccessAt,
+    });
+    const weeklyReport = {
+        headline: primaryState === "CHANGES_DETECTED"
+            ? `${recentChanges} competitor signals detected in the last 24 hours`
+            : primaryState === "NO_CHANGES"
+                ? "Competitor analysis is active with no new changes"
+                : primaryState === "LOW_CONFIDENCE"
+                    ? "Possible competitor overlap was found, but confidence is still low"
+                    : primaryState === "NO_MATCHES"
+                        ? "Competitor analysis completed, but no comparable matches were found"
+                        : store.competitorDomains.length > 0
+                            ? "Competitor analysis is not ready for a brief yet"
+                            : "Add competitor websites to begin analysis",
+        whyItMatters: primaryState === "CHANGES_DETECTED" || primaryState === "NO_CHANGES"
+            ? "Live competitor observations are available for pricing, promotion, stock, and visibility review."
+            : primaryState === "LOW_CONFIDENCE"
+                ? "Some pages resembled competitor product pages, but the captured pricing and product signals were not strong enough to trust yet."
+                : primaryState === "NO_MATCHES"
+                    ? "Your domains were refreshed successfully, but VedaSuite did not find overlapping competitor products to compare yet."
+                    : store.competitorDomains.length > 0
+                        ? "Competitor websites are configured. Matched products are needed before weekly reporting becomes useful."
+                        : "Add competitor websites to begin tracking pricing and promotion trends.",
+        suggestedActions: actionSuggestions.length > 0
+            ? actionSuggestions.map((item) => `${item.productHandle}: ${item.suggestion}`)
+            : primaryState === "LOW_CONFIDENCE"
+                ? [
+                    "Review website relevance and ensure competitor products overlap your active catalog.",
+                    "Run analysis again after refining competitor websites.",
+                ]
+                : primaryState === "NO_MATCHES"
+                    ? [
+                        "Review tracked products and competitor websites for overlap.",
+                        "Add more competitor websites and run another analysis.",
+                    ]
+                    : store.competitorDomains.length > 0
+                        ? ["Run competitor analysis.", "Review changes after the first analysis."]
+                        : ["Add competitor websites.", "Run your first analysis."],
+        reportReadiness: primaryState === "CHANGES_DETECTED" || primaryState === "NO_CHANGES"
+            ? "Live competitor report available"
+            : primaryState === "LOW_CONFIDENCE"
+                ? "Waiting for stronger match confidence"
+                : primaryState === "NO_MATCHES"
+                    ? "Waiting for matched products"
+                    : lastSuccessAt
+                        ? "Waiting for matched competitor products"
+                        : "Ready for first analysis",
+        biggestMoves: moveFeed.slice(0, 3).map((item) => ({
+            headline: item.headline,
+            impactScore: item.impactScore,
+            suggestedAction: item.suggestedAction,
+        })),
+        merchantBrief: strategyDetections[0]?.implication ??
+            ((primaryState === "CHANGES_DETECTED" || primaryState === "NO_CHANGES")
+                ? "No dominant competitor strategy stands out from the current competitor evidence yet."
+                : primaryState === "LOW_CONFIDENCE"
+                    ? "VedaSuite needs stronger comparable-product confirmation before it can build a reliable competitor brief."
+                    : primaryState === "NO_MATCHES"
+                        ? "VedaSuite needs comparable competitor product matches before it can build a reliable weekly brief."
+                        : "VedaSuite will build a weekly competitor brief after the first successful matched analysis."),
+        nextBestAction: actionSuggestions[0]?.suggestion ??
+            (primaryState === "LOW_CONFIDENCE"
+                ? "Review websites and prioritize competitor sites with clearer product overlap."
+                : primaryState === "NO_MATCHES"
+                    ? "Review tracked products and add more relevant competitor websites."
+                    : store.competitorDomains.length > 0
+                        ? "Run analysis to populate competitor changes."
+                        : "Add competitor websites and begin analysis."),
+    };
+    const moduleState = primaryState === "SETUP_INCOMPLETE"
+        ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+            setupStatus: "incomplete",
+            syncStatus: syncStatusLabel === "FAILED" ? "failed" : "idle",
+            dataStatus: "empty",
+            lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+            lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+            coverage: "none",
+            dependencies: {
+                competitor: competitorDependencyState,
+                pricing: pricingDependencyState,
+                fraud: fraudDependencyState,
+            },
+            title: primaryStateCopy.title,
+            description: primaryStateCopy.description,
+            nextAction: primaryStateCopy.nextAction,
+        })
+        : syncStatusLabel === "RUNNING"
+            ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                setupStatus: "complete",
+                syncStatus: "running",
+                dataStatus: "processing",
+                lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                coverage: matchedProductsCount > 0 ? "partial" : "none",
+                dependencies: {
+                    competitor: competitorDependencyState,
+                    pricing: pricingDependencyState,
+                    fraud: fraudDependencyState,
+                },
+                title: "Competitor analysis is updating",
+                description: "VedaSuite is checking competitor domains and updating matched products.",
+                nextAction: "Wait for refresh to finish",
+            })
+            : primaryState === "FAILURE"
+                ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                    setupStatus: "complete",
+                    syncStatus: "failed",
+                    dataStatus: "failed",
+                    lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                    lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                    coverage: matchedProductsCount > 0 ? "partial" : "none",
+                    dependencies: {
+                        competitor: competitorDependencyState,
+                        pricing: pricingDependencyState,
+                        fraud: fraudDependencyState,
+                    },
+                    title: primaryStateCopy.title,
+                    description: primaryStateCopy.description,
+                    nextAction: primaryStateCopy.nextAction,
+                })
+                : primaryState === "STALE"
+                    ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                        setupStatus: "complete",
+                        syncStatus: "completed",
+                        dataStatus: "stale",
+                        lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                        lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                        dataChanged: changesDetected > 0,
+                        coverage: matchedProductsCount > 0 ? "partial" : "none",
+                        dependencies: {
+                            competitor: competitorDependencyState,
+                            pricing: pricingDependencyState,
+                            fraud: fraudDependencyState,
+                        },
+                        title: primaryStateCopy.title,
+                        description: primaryStateCopy.description,
+                        nextAction: primaryStateCopy.nextAction,
+                    })
+                    : primaryState === "AWAITING_FIRST_RUN"
+                        ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                            setupStatus: "complete",
+                            syncStatus: operational.latestCompetitorIngestJob?.status === "RUNNING"
+                                ? "running"
+                                : "idle",
+                            dataStatus: operational.latestCompetitorIngestJob?.status === "RUNNING"
+                                ? "processing"
+                                : "empty",
+                            lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                            lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                            coverage: "none",
+                            dependencies: {
+                                competitor: competitorDependencyState,
+                                pricing: pricingDependencyState,
+                                fraud: fraudDependencyState,
+                            },
+                            title: primaryStateCopy.title,
+                            description: primaryStateCopy.description,
+                            nextAction: primaryStateCopy.nextAction,
+                        })
+                        : primaryState === "NO_MATCHES"
+                            ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                                setupStatus: "complete",
+                                syncStatus: "completed",
+                                dataStatus: "empty",
+                                lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                                lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                                coverage: "none",
+                                dependencies: {
+                                    competitor: competitorDependencyState,
+                                    pricing: pricingDependencyState,
+                                    fraud: fraudDependencyState,
+                                },
+                                title: primaryStateCopy.title,
+                                description: primaryStateCopy.description,
+                                nextAction: primaryStateCopy.nextAction,
+                            })
+                            : primaryState === "LOW_CONFIDENCE"
+                                ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                                    setupStatus: "complete",
+                                    syncStatus: "completed",
+                                    dataStatus: "partial",
+                                    lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                                    lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                                    coverage: "partial",
+                                    dependencies: {
+                                        competitor: competitorDependencyState,
+                                        pricing: pricingDependencyState,
+                                        fraud: fraudDependencyState,
+                                    },
+                                    title: primaryStateCopy.title,
+                                    description: primaryStateCopy.description,
+                                    nextAction: primaryStateCopy.nextAction,
+                                })
+                                : crawlStatus === "PARTIAL" || snapshotStatus === "PARTIAL"
+                                    ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                                        setupStatus: "complete",
+                                        syncStatus: "completed",
+                                        dataStatus: "partial",
+                                        lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                                        lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                                        dataChanged: detectedPriceChangesCount > 0 || detectedPromotionChangesCount > 0,
+                                        coverage: "partial",
+                                        dependencies: {
+                                            competitor: competitorDependencyState,
+                                            pricing: pricingDependencyState,
+                                            fraud: fraudDependencyState,
+                                        },
+                                        title: "Competitor data is available with partial coverage",
+                                        description: "Some competitor products matched, but coverage is still incomplete across the tracked catalog.",
+                                        nextAction: "Review tracked products or update competitor domains",
+                                    })
+                                    : primaryState === "NO_CHANGES"
+                                        ? (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                                            setupStatus: "complete",
+                                            syncStatus: "completed",
+                                            dataStatus: "empty",
+                                            lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                                            lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                                            coverage: "full",
+                                            dependencies: {
+                                                competitor: competitorDependencyState,
+                                                pricing: pricingDependencyState,
+                                                fraud: fraudDependencyState,
+                                            },
+                                            title: primaryStateCopy.title,
+                                            description: primaryStateCopy.description,
+                                            nextAction: primaryStateCopy.nextAction,
+                                        })
+                                        : (0, unifiedModuleStateService_1.createUnifiedModuleState)({
+                                            setupStatus: "complete",
+                                            syncStatus: "completed",
+                                            dataStatus: "ready",
+                                            lastSuccessfulSyncAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+                                            lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+                                            dataChanged: true,
+                                            coverage: "full",
+                                            dependencies: {
+                                                competitor: competitorDependencyState,
+                                                pricing: pricingDependencyState,
+                                                fraud: fraudDependencyState,
+                                            },
+                                            title: primaryStateCopy.title,
+                                            description: primaryStateCopy.description,
+                                            nextAction: primaryStateCopy.nextAction,
+                                        });
     return {
+        competitorState: {
+            primaryState,
+            setupStatus: store.competitorDomains.length === 0 ? "not_configured" : "configured",
+            ingestionStatus: syncStatusLabel === "RUNNING"
+                ? "running"
+                : syncStatusLabel === "FAILED"
+                    ? "failed"
+                    : lastSuccessAt
+                        ? "completed"
+                        : "never_run",
+            matchStatus: matchedProductsCount === 0 && lowConfidenceMatchesCount > 0
+                ? "partial_matches"
+                : matchedProductsCount === 0
+                    ? "no_matches"
+                    : crawlStatus === "PARTIAL"
+                        ? "partial_matches"
+                        : "matched",
+            changeStatus: changesDetected > 0 ? "changes_detected" : "no_changes",
+            freshnessStatus: freshnessStatus === "STALE" ? "stale" : "fresh",
+            freshnessLabel,
+            channels: {
+                website: store.competitorDomains.length === 0
+                    ? "not_configured"
+                    : lastSuccessAt
+                        ? "connected"
+                        : "ready_for_analysis",
+                googleShopping: "beta",
+                metaAds: "beta",
+            },
+            lastSuccessfulRunAt: (0, unifiedModuleStateService_1.toIsoString)(lastSuccessAt),
+            lastAttemptAt: (0, unifiedModuleStateService_1.toIsoString)(lastAttemptAt),
+            configuredDomainsCount: store.competitorDomains.length,
+            checkedDomainsCount,
+            monitoredProductsCount,
+            matchedProductsCount,
+            validMatchedProductsCount: matchedProductsCount,
+            lowConfidenceMatchesCount,
+            excludedProductsCount: eligibleProducts.excludedCount,
+            excludedProducts: eligibleProducts.excluded,
+            activePromotionsCount: promoCount,
+            activePromotionCount: promoCount,
+            stockAlertsCount: stockAlerts,
+            detectedPriceChangesCount,
+            detectedPromotionChangesCount,
+            coverageStatus: primaryStateCopy.coverageStatus,
+            title: primaryStateCopy.title,
+            description: primaryStateCopy.description,
+            confidenceExplanation: primaryState === "LOW_CONFIDENCE"
+                ? "Possible competitor pages were found, but they did not provide strong enough live pricing or product signals to count as reliable comparable matches."
+                : primaryState === "NO_MATCHES"
+                    ? "VedaSuite only counts a comparable match when the competitor page provides strong enough live product evidence."
+                    : "Comparable products shown on this page passed the current match-confidence checks.",
+            actionPanel: {
+                headline: primaryState === "SETUP_INCOMPLETE"
+                    ? "Add competitor websites"
+                    : primaryState === "AWAITING_FIRST_RUN"
+                        ? "Run the first analysis"
+                        : primaryState === "NO_MATCHES"
+                            ? "Improve comparable-product coverage"
+                            : primaryState === "LOW_CONFIDENCE"
+                                ? "Strengthen match confidence"
+                                : primaryState === "CHANGES_DETECTED"
+                                    ? "Review competitor changes"
+                                    : "Keep competitor analysis active",
+                explanation: primaryState === "SETUP_INCOMPLETE"
+                    ? "Add relevant competitor websites before VedaSuite can compare live competitor products."
+                    : primaryState === "AWAITING_FIRST_RUN"
+                        ? "Competitor websites are configured. The next analysis will compare those sites with your active catalog."
+                        : primaryState === "NO_MATCHES"
+                            ? "Competitor analysis completed. No matching products were identified yet."
+                            : primaryState === "LOW_CONFIDENCE"
+                                ? "Analysis found possible overlap, but the captured competitor pages need stronger evidence."
+                                : primaryState === "CHANGES_DETECTED"
+                                    ? "Prioritize the products with live price, promotion, or stock changes first."
+                                    : "Competitor analysis is active. No urgent competitor action is required right now.",
+                actions: primaryState === "SETUP_INCOMPLETE"
+                    ? ["Add competitor websites", "Run analysis"]
+                    : primaryState === "AWAITING_FIRST_RUN"
+                        ? ["Run competitor analysis", "Review active catalog coverage"]
+                        : primaryState === "NO_MATCHES"
+                            ? [
+                                "Review active products for overlap with competitor websites",
+                                "Add more relevant competitor websites",
+                                "Run analysis again",
+                            ]
+                            : primaryState === "LOW_CONFIDENCE"
+                                ? [
+                                    "Review website quality and product overlap",
+                                    "Prioritize competitors with clearer product pages",
+                                    "Run analysis again",
+                                ]
+                                : primaryState === "CHANGES_DETECTED"
+                                    ? [
+                                        "Open the move feed and review changed products",
+                                        "Use response guidance for highest-pressure products",
+                                    ]
+                                    : ["Run analysis again later", "Review tracked products"],
+            },
+            nextAction: primaryStateCopy.nextAction,
+            toastMessage: primaryStateCopy.toastMessage,
+        },
+        moduleState,
+        monitoringStatus: {
+            setupStatus,
+            syncStatus: syncStatusLabel,
+            crawlStatus,
+            snapshotStatus,
+            freshnessStatus,
+            lastSuccessAt,
+            lastAttemptAt,
+            checkedDomainsCount,
+            monitoredProductsCount,
+            matchedProductsCount,
+            lowConfidenceMatchesCount,
+            detectedPriceChangesCount,
+            detectedPromotionChangesCount,
+            latestSyncReason: latestCompetitorSummary?.reason ??
+                latestCompetitorJob?.errorMessage ??
+                null,
+        },
+        readiness,
         recentPriceChanges: recentChanges,
         promotionAlerts: promoCount,
         stockMovementAlerts: stockAlerts,
-        trackedDomains: domains,
+        trackedDomains: store.competitorDomains.length,
         lastIngestedAt,
         freshnessHours,
-        promotionalHeat,
-        marketPressure,
+        promotionalHeat: promoCount >= 15 ? "High" : promoCount >= 7 ? "Medium" : "Low",
+        marketPressure: recentChanges >= 24 ? "High" : recentChanges >= 10 ? "Medium" : recentChanges > 0 ? "Low" : "No live market data",
+        adPressure: sourceBreakdown.metaAds > 0
+            ? "Beta ad-library signal available"
+            : "Not enabled",
+        launchAlerts: recentRows
+            .filter((row) => !!row.promotion && /launch|new/i.test(row.promotion))
+            .slice(0, 5)
+            .map((row) => ({
+            productHandle: row.productHandle,
+            competitorName: row.competitorName,
+            source: row.source,
+            collectedAt: row.collectedAt,
+        })),
         sourceBreakdown,
         topMovers,
+        moveFeed,
+        lowConfidenceRows: comparableRecentRows.lowConfidenceRows.slice(0, 6).map((row) => {
+            const metadata = normalizeCompetitorMetadata(row);
+            return {
+                id: row.id,
+                productHandle: row.productHandle,
+                competitorName: row.competitorName,
+                confidenceLabel: metadata.confidenceLabel,
+                confidenceScore: metadata.confidenceScore,
+                matchReason: metadata.matchReason,
+            };
+        }),
+        productCoverage: {
+            eligibleProductsCount: eligibleProducts.eligible.length,
+            excludedProductsCount: eligibleProducts.excludedCount,
+            excludedProducts: eligibleProducts.excluded,
+            explanation: eligibleProducts.excludedCount > 0
+                ? `Draft, archived, gift-card-like, or price-missing products are excluded from competitor analysis to keep matches useful.`
+                : "Only active catalog products with usable pricing are monitored for competitor overlap.",
+        },
+        strategyDetections,
+        actionSuggestions,
+        weeklyReport,
+        coverageSummary: {
+            domainsConfigured: store.competitorDomains.length,
+            channelsReady: [
+                store.competitorDomains.length > 0 ? "Competitor website" : null,
+                sourceBreakdown.googleShopping > 0 ? "Shopping beta" : null,
+                sourceBreakdown.metaAds > 0 ? "Ad-library beta" : null,
+            ].filter((item) => item !== null),
+            monitoringPosture: primaryStateCopy.coverageStatus,
+        },
     };
 }
 async function listTrackedCompetitorProducts(shopDomain) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
+    const store = await getStore(shopDomain);
+    const rows = await getCompetitorRows(store.id, 150);
+    return filterComparableRows(rows).comparableRows.map((row) => {
+        const metadata = normalizeCompetitorMetadata(row);
+        return {
+            ...row,
+            confidenceScore: metadata.confidenceScore,
+            confidenceLabel: metadata.confidenceLabel,
+            matchReason: metadata.matchReason,
+            competitorProductTitle: metadata.competitorProductTitle ?? null,
+            competitorProductHandle: metadata.competitorProductHandle ?? null,
+            catalogObservation: !!metadata.catalogObservation,
+        };
     });
-    if (!store)
-        throw new Error("Store not found");
-    const rows = await prismaClient_1.prisma.competitorData.findMany({
-        where: { storeId: store.id },
-        orderBy: { collectedAt: "desc" },
-        take: 100,
-    });
-    return rows;
 }
 async function listCompetitorConnectors(shopDomain) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
-        include: {
-            competitorDomains: true,
-            competitorData: {
-                orderBy: { collectedAt: "desc" },
-                take: 300,
-            },
-        },
-    });
-    if (!store)
-        throw new Error("Store not found");
+    const store = await getStore(shopDomain);
+    const rows = await getCompetitorRows(store.id, 300);
     const latestBySource = new Map();
-    for (const row of store.competitorData) {
+    const websiteLastIngestedAt = rows.find((row) => row.source === "website_live")?.collectedAt ??
+        rows.find((row) => row.source === "website_catalog")?.collectedAt ??
+        rows.find((row) => row.source === "website")?.collectedAt ??
+        null;
+    for (const row of rows) {
         if (!latestBySource.has(row.source)) {
             latestBySource.set(row.source, row.collectedAt);
         }
@@ -184,141 +1204,423 @@ async function listCompetitorConnectors(shopDomain) {
         {
             id: "website",
             label: "Website crawler",
-            description: "Fetches live product pages from tracked competitor domains.",
+            description: "Fetches live competitor storefront observations from tracked domains.",
             connected: store.competitorDomains.length > 0,
             trackedTargets: store.competitorDomains.length,
-            lastIngestedAt: latestBySource.get("website_live") ?? latestBySource.get("website") ?? null,
-            readiness: store.competitorDomains.length > 1 ? "Healthy" : store.competitorDomains.length === 1 ? "Limited" : "Needs setup",
+            lastIngestedAt: websiteLastIngestedAt,
+            readiness: store.competitorDomains.length === 0
+                ? "Not enabled"
+                : websiteLastIngestedAt
+                    ? "Live"
+                    : "Configured",
+            action: store.competitorDomains.length === 0
+                ? "Add domains"
+                : websiteLastIngestedAt
+                    ? "No action needed"
+                    : "Run refresh",
         },
         {
             id: "google_shopping",
-            label: "Google Shopping feed",
-            description: "Builds market price snapshots for tracked catalog handles.",
-            connected: store.competitorDomains.length > 0,
-            trackedTargets: store.competitorDomains.length,
-            lastIngestedAt: latestBySource.get("google_shopping") ?? null,
-            readiness: latestBySource.get("google_shopping") != null ? "Healthy" : "Pending first ingest",
+            label: "Shopping beta",
+            description: "Beta integration for catalog-based shopping signals.",
+            connected: false,
+            trackedTargets: 0,
+            lastIngestedAt: null,
+            readiness: "Beta",
+            action: "No action needed",
         },
         {
             id: "meta_ads",
-            label: "Meta Ad Library",
-            description: "Captures promotion pressure and ad-activity signals.",
-            connected: store.competitorDomains.length > 0,
-            trackedTargets: store.competitorDomains.length,
-            lastIngestedAt: latestBySource.get("meta_ads") ?? null,
-            readiness: latestBySource.get("meta_ads") != null ? "Healthy" : "Pending first ingest",
+            label: "Ad-library beta",
+            description: "Beta integration for ad-library signals.",
+            connected: false,
+            trackedTargets: 0,
+            lastIngestedAt: null,
+            readiness: "Beta",
+            action: "No action needed",
         },
     ];
 }
 async function updateCompetitorDomains(shopDomain, domains) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
-    });
-    if (!store)
-        throw new Error("Store not found");
+    const store = await getStore(shopDomain);
+    const normalizedDomains = domains
+        .map((domain) => {
+        const normalizedDomain = normalizeCompetitorDomainInput(domain.domain);
+        return normalizedDomain
+            ? {
+                domain: normalizedDomain,
+                label: domain.label?.trim() || null,
+            }
+            : null;
+    })
+        .filter((domain) => !!domain)
+        .filter((domain, index, allDomains) => allDomains.findIndex((candidate) => candidate.domain === domain.domain) === index);
     await prismaClient_1.prisma.competitorDomain.deleteMany({
         where: { storeId: store.id },
     });
-    await prismaClient_1.prisma.competitorDomain.createMany({
-        data: domains.map((d) => ({
-            storeId: store.id,
-            domain: d.domain,
-            label: d.label,
-        })),
-    });
-    const updated = await prismaClient_1.prisma.competitorDomain.findMany({
+    await prismaClient_1.prisma.competitorData.deleteMany({
         where: { storeId: store.id },
     });
-    return updated;
+    if (normalizedDomains.length > 0) {
+        await prismaClient_1.prisma.competitorDomain.createMany({
+            data: normalizedDomains.map((domain) => ({
+                storeId: store.id,
+                domain: domain.domain,
+                label: domain.label ?? undefined,
+            })),
+        });
+    }
+    return prismaClient_1.prisma.competitorDomain.findMany({
+        where: { storeId: store.id },
+    });
 }
 async function ingestCompetitorSnapshots(shopDomain) {
-    const store = await prismaClient_1.prisma.store.findUnique({
-        where: { shop: shopDomain },
-        include: {
-            competitorDomains: true,
+    const store = await getStore(shopDomain);
+    const domains = store.competitorDomains
+        .flatMap((domain) => domain.domain.split(/[\n,]+/).map((part) => ({
+        ...domain,
+        domain: normalizeCompetitorDomainInput(part.trim()) ?? "",
+    })))
+        .filter((domain) => domain.domain.length > 0)
+        .filter((domain, index, all) => all.findIndex((d) => d.domain === domain.domain) === index);
+    const job = await prismaClient_1.prisma.syncJob.create({
+        data: {
+            storeId: store.id,
+            jobType: "competitor_ingest",
+            triggerSource: "manual",
+            status: "RUNNING",
+            startedAt: new Date(),
         },
     });
-    if (!store)
-        throw new Error("Store not found");
-    const domains = store.competitorDomains;
-    if (domains.length === 0) {
-        return {
-            ingested: 0,
-            domains: 0,
-            products: 0,
-        };
-    }
-    const sourceProducts = await prismaClient_1.prisma.priceHistory.findMany({
-        where: { storeId: store.id },
-        orderBy: { createdAt: "desc" },
-        distinct: ["productHandle"],
-        take: 12,
-    });
-    let ingested = 0;
-    for (const domain of domains) {
-        for (const [index, product] of sourceProducts.entries()) {
-            const competitorName = normalizeCompetitorName(domain.domain, domain.label);
-            const promoIndex = (domain.domain.length + index) % 4;
-            const fallbackPromotion = promoIndex === 0 ? "12% off" : promoIndex === 1 ? "Bundle offer" : null;
-            const fallbackStockStatus = promoIndex === 2 ? "low_stock" : promoIndex === 3 ? "out_of_stock" : "in_stock";
-            const priceShift = ((domain.domain.length % 7) - 3) * 0.9;
-            const fallbackPrice = Number(Math.max(1, product.currentPrice + priceShift).toFixed(2));
-            const liveSnapshot = await (0, shopifyAdminService_1.fetchCompetitorSnapshot)(domain.domain, product.productHandle, fallbackPrice);
-            await prismaClient_1.prisma.competitorData.create({
+    try {
+        if (domains.length === 0) {
+            const result = {
+                ingested: 0,
+                domains: 0,
+                products: 0,
+                skipped: 0,
+                status: "SUCCEEDED_NO_DATA",
+                reason: "No competitor domains are configured for this store.",
+                merchantMessage: "Add competitor domains before running a refresh.",
+            };
+            await prismaClient_1.prisma.syncJob.update({
+                where: { id: job.id },
                 data: {
-                    storeId: store.id,
-                    productHandle: product.productHandle,
-                    competitorName,
-                    competitorUrl: `https://${domain.domain}/products/${product.productHandle}`,
-                    source: liveSnapshot?.source ?? "website",
-                    price: liveSnapshot?.price ?? fallbackPrice,
-                    promotion: liveSnapshot?.promotion ?? fallbackPromotion,
-                    stockStatus: liveSnapshot?.stockStatus ?? fallbackStockStatus,
-                    insightsJson: JSON.stringify({
-                        ingestionSource: "tracked-domain-workflow",
-                        capturedAt: new Date().toISOString(),
-                        priceDelta: Number(((liveSnapshot?.price ?? fallbackPrice) - product.currentPrice).toFixed(2)),
-                        externalFetch: !!liveSnapshot,
-                    }),
+                    status: "SUCCEEDED_NO_DATA",
+                    finishedAt: new Date(),
+                    summaryJson: JSON.stringify(result),
                 },
             });
-            ingested += 1;
-            const googleSignal = buildGoogleShoppingSignal(domain.domain, product.productHandle, fallbackPrice, competitorName);
-            await prismaClient_1.prisma.competitorData.create({
-                data: {
-                    storeId: store.id,
-                    productHandle: product.productHandle,
-                    competitorName,
-                    competitorUrl: googleSignal.competitorUrl,
-                    source: googleSignal.source,
-                    price: googleSignal.price,
-                    promotion: googleSignal.promotion,
-                    stockStatus: googleSignal.stockStatus,
-                    insightsJson: googleSignal.insightsJson,
-                },
-            });
-            ingested += 1;
-            const metaSignal = buildMetaAdSignal(domain.domain, product.productHandle, fallbackPrice, competitorName);
-            await prismaClient_1.prisma.competitorData.create({
-                data: {
-                    storeId: store.id,
-                    productHandle: product.productHandle,
-                    competitorName,
-                    competitorUrl: metaSignal.competitorUrl,
-                    source: metaSignal.source,
-                    price: metaSignal.price,
-                    promotion: metaSignal.promotion,
-                    stockStatus: metaSignal.stockStatus,
-                    adCopy: metaSignal.adCopy,
-                    insightsJson: metaSignal.insightsJson,
-                },
-            });
-            ingested += 1;
+            return result;
         }
+        const sourceProducts = filterCompetitorSourceProducts(store.productSnapshots.map((product) => ({
+            productHandle: product.handle,
+            title: product.title,
+            status: product.status,
+            currentPrice: product.currentPrice ?? null,
+        })));
+        if (sourceProducts.eligible.length === 0) {
+            let catalogIngested = 0;
+            for (const domain of domains) {
+                const catalogProducts = await fetchCompetitorCatalogProducts(domain.domain, 8);
+                for (const competitorProduct of catalogProducts.filter((product) => product.price != null)) {
+                    await prismaClient_1.prisma.competitorData.create({
+                        data: {
+                            storeId: store.id,
+                            productHandle: competitorProduct.handle,
+                            competitorName: normalizeCompetitorName(domain.domain, domain.label),
+                            competitorUrl: competitorProduct.url,
+                            source: "website_catalog",
+                            price: competitorProduct.price,
+                            promotion: null,
+                            stockStatus: competitorProduct.available === false ? "out_of_stock" : "in_stock",
+                            adCopy: null,
+                            insightsJson: JSON.stringify({
+                                ingestionSource: "competitor_catalog_analysis",
+                                capturedAt: new Date().toISOString(),
+                                externalFetch: true,
+                                catalogObservation: true,
+                                competitorProductTitle: competitorProduct.title,
+                                competitorProductHandle: competitorProduct.handle,
+                                confidenceScore: 64,
+                                confidenceLabel: "medium",
+                                matchReason: "Competitor catalog product and price were detected. Add matching products to the Shopify catalog for direct product comparison.",
+                                usedFallbackPrice: false,
+                            }),
+                        },
+                    });
+                    catalogIngested += 1;
+                }
+            }
+            if (catalogIngested > 0) {
+                const result = {
+                    ingested: catalogIngested,
+                    domains: domains.length,
+                    products: catalogIngested,
+                    skipped: 0,
+                    lowConfidenceMatches: 0,
+                    status: "SUCCEEDED",
+                    reason: null,
+                    merchantMessage: "Competitor analysis completed. Competitor products were detected from the tracked domains.",
+                    excludedProducts: sourceProducts.excluded,
+                };
+                await prismaClient_1.prisma.syncJob.update({
+                    where: { id: job.id },
+                    data: {
+                        status: "SUCCEEDED",
+                        finishedAt: new Date(),
+                        summaryJson: JSON.stringify(result),
+                        errorMessage: null,
+                    },
+                });
+                return result;
+            }
+            const result = {
+                ingested: 0,
+                domains: domains.length,
+                products: 0,
+                skipped: 0,
+                status: "SUCCEEDED_NO_DATA",
+                reason: sourceProducts.excludedCount > 0
+                    ? "No eligible active products were available for competitor analysis after draft, archived, gift-card-like, and price-missing products were excluded."
+                    : "No active priced products were available for competitor analysis yet.",
+                merchantMessage: "Refresh completed, but there were no eligible active products available for competitor matching yet.",
+                excludedProducts: sourceProducts.excluded,
+            };
+            await prismaClient_1.prisma.syncJob.update({
+                where: { id: job.id },
+                data: {
+                    status: "SUCCEEDED_NO_DATA",
+                    finishedAt: new Date(),
+                    summaryJson: JSON.stringify(result),
+                },
+            });
+            return result;
+        }
+        let ingested = 0;
+        let lowConfidenceMatches = 0;
+        let skipped = 0;
+        for (const domain of domains) {
+            const catalogProducts = await fetchCompetitorCatalogProducts(domain.domain, 40);
+            let domainIngested = 0;
+            for (const product of sourceProducts.eligible.slice(0, 18)) {
+                const liveSnapshot = await (0, shopifyAdminService_1.fetchCompetitorSnapshot)(domain.domain, product.productHandle, product.currentPrice ?? 0);
+                const bestCatalogMatch = !liveSnapshot && catalogProducts.length > 0
+                    ? findBestCatalogMatch(product, catalogProducts)
+                    : null;
+                if (!liveSnapshot && (!bestCatalogMatch || bestCatalogMatch.score < 24)) {
+                    skipped += 1;
+                    continue;
+                }
+                const catalogSnapshot = !liveSnapshot && bestCatalogMatch
+                    ? {
+                        competitorUrl: bestCatalogMatch.product.url,
+                        price: bestCatalogMatch.product.price,
+                        promotion: null,
+                        stockStatus: bestCatalogMatch.product.available === false
+                            ? "out_of_stock"
+                            : "in_stock",
+                        source: "website_catalog",
+                        adCopy: null,
+                        confidenceScore: Math.max(62, Math.min(88, bestCatalogMatch.score)),
+                        confidenceLabel: bestCatalogMatch.score >= 72
+                            ? "high"
+                            : "medium",
+                        matchReason: bestCatalogMatch.score >= 72
+                            ? "Competitor catalog product matched by title or handle and a price was detected."
+                            : "Competitor catalog product was detected as a market reference. Review before treating it as a direct product match.",
+                        usedFallbackPrice: false,
+                        competitorProductTitle: bestCatalogMatch.product.title,
+                        competitorProductHandle: bestCatalogMatch.product.handle,
+                        catalogObservation: bestCatalogMatch.score < 72,
+                    }
+                    : null;
+                const capturedSnapshot = liveSnapshot ?? catalogSnapshot;
+                if (!capturedSnapshot) {
+                    skipped += 1;
+                    continue;
+                }
+                if (capturedSnapshot.confidenceScore < 60) {
+                    lowConfidenceMatches += 1;
+                }
+                await prismaClient_1.prisma.competitorData.create({
+                    data: {
+                        storeId: store.id,
+                        productHandle: product.productHandle,
+                        competitorName: normalizeCompetitorName(domain.domain, domain.label),
+                        competitorUrl: capturedSnapshot.competitorUrl ??
+                            `https://${domain.domain}/products/${product.productHandle}`,
+                        source: capturedSnapshot.source ?? "website_live",
+                        price: capturedSnapshot.price ?? null,
+                        promotion: capturedSnapshot.promotion ?? null,
+                        stockStatus: capturedSnapshot.stockStatus ?? null,
+                        adCopy: capturedSnapshot.adCopy ?? null,
+                        insightsJson: JSON.stringify({
+                            ingestionSource: liveSnapshot
+                                ? "live_competitor_fetch"
+                                : "competitor_catalog_analysis",
+                            capturedAt: new Date().toISOString(),
+                            externalFetch: true,
+                            sourceProductTitle: product.title,
+                            sourceProductStatus: product.status,
+                            competitorProductTitle: catalogSnapshot?.competitorProductTitle,
+                            competitorProductHandle: catalogSnapshot?.competitorProductHandle,
+                            catalogObservation: catalogSnapshot?.catalogObservation ?? false,
+                            confidenceScore: capturedSnapshot.confidenceScore,
+                            confidenceLabel: capturedSnapshot.confidenceLabel,
+                            matchReason: capturedSnapshot.matchReason,
+                            usedFallbackPrice: capturedSnapshot.usedFallbackPrice,
+                        }),
+                    },
+                });
+                ingested += 1;
+                domainIngested += 1;
+            }
+            if (domainIngested === 0 && catalogProducts.length > 0) {
+                for (const competitorProduct of catalogProducts
+                    .filter((product) => product.price != null)
+                    .slice(0, 8)) {
+                    await prismaClient_1.prisma.competitorData.create({
+                        data: {
+                            storeId: store.id,
+                            productHandle: competitorProduct.handle,
+                            competitorName: normalizeCompetitorName(domain.domain, domain.label),
+                            competitorUrl: competitorProduct.url,
+                            source: "website_catalog",
+                            price: competitorProduct.price,
+                            promotion: null,
+                            stockStatus: competitorProduct.available === false ? "out_of_stock" : "in_stock",
+                            adCopy: null,
+                            insightsJson: JSON.stringify({
+                                ingestionSource: "competitor_catalog_analysis",
+                                capturedAt: new Date().toISOString(),
+                                externalFetch: true,
+                                catalogObservation: true,
+                                competitorProductTitle: competitorProduct.title,
+                                competitorProductHandle: competitorProduct.handle,
+                                confidenceScore: 64,
+                                confidenceLabel: "medium",
+                                matchReason: "Competitor catalog product and price were detected. No direct Shopify catalog match was found yet.",
+                                usedFallbackPrice: false,
+                            }),
+                        },
+                    });
+                    ingested += 1;
+                    domainIngested += 1;
+                }
+            }
+        }
+        const status = ingested > 0 ? "SUCCEEDED" : "SUCCEEDED_NO_DATA";
+        const result = {
+            ingested,
+            domains: domains.length,
+            products: sourceProducts.eligible.length,
+            skipped,
+            lowConfidenceMatches,
+            excludedProducts: sourceProducts.excluded,
+            status,
+            reason: ingested > 0
+                ? null
+                : "Competitor pages were fetched, but no competitor catalog or product price data was captured.",
+            merchantMessage: ingested > 0 && lowConfidenceMatches === 0
+                ? "Competitor analysis completed successfully."
+                : ingested > 0 && lowConfidenceMatches === ingested
+                    ? "Refresh completed. Possible competitor pages were found, but the matches were too weak to rely on yet."
+                    : skipped > 0
+                        ? "Competitor analysis completed. No matching products were identified yet."
+                        : "Refresh completed. No competitor changes detected.",
+        };
+        await prismaClient_1.prisma.syncJob.update({
+            where: { id: job.id },
+            data: {
+                status,
+                finishedAt: new Date(),
+                summaryJson: JSON.stringify(result),
+                errorMessage: ingested > 0 ? null : result.reason,
+            },
+        });
+        return result;
     }
+    catch (error) {
+        const message = error instanceof Error
+            ? error.message
+            : "Competitor ingestion failed.";
+        await prismaClient_1.prisma.syncJob.update({
+            where: { id: job.id },
+            data: {
+                status: "FAILED",
+                finishedAt: new Date(),
+                errorMessage: message,
+            },
+        });
+        throw error;
+    }
+}
+async function getCompetitorResponseEngine(shopDomain) {
+    const overview = await getCompetitorOverview(shopDomain);
+    const responsePlans = (overview.topMovers ?? [])
+        .map((mover) => {
+        const pressureScore = Math.min(100, Math.round(Math.abs(mover.priceDelta) * 18 +
+            mover.promotionSignals * 16 +
+            mover.stockSignals * 12));
+        return {
+            productHandle: mover.productHandle,
+            pressureScore,
+            recommendedPlay: mover.promotionSignals >= 2
+                ? "bundle_or_selective_match"
+                : mover.priceDelta <= -2
+                    ? "review_price"
+                    : mover.stockSignals > 0
+                        ? "hold_and_monitor"
+                        : "wait_and_monitor",
+            rationale: mover.promotionSignals >= 2
+                ? "Promotion clustering suggests a selective response is safer than broad discounting."
+                : mover.priceDelta <= -2
+                    ? "Live competitor price movement is large enough to review the SKU."
+                    : mover.stockSignals > 0
+                        ? "Competitor stock pressure may ease without a reactive price move."
+                        : "Current live signals do not justify an immediate reaction.",
+            priceDelta: mover.priceDelta,
+            promotionSignals: mover.promotionSignals,
+            stockSignals: mover.stockSignals,
+            sourceCount: Number(mover.promotionSignals > 0) +
+                Number(mover.stockSignals > 0) +
+                Number(mover.priceDelta !== 0),
+            confidence: Math.max(35, Math.min(80, pressureScore)),
+            reasons: [
+                mover.priceDelta !== 0
+                    ? `Observed price delta: ${mover.priceDelta >= 0 ? "+" : "-"}$${Math.abs(mover.priceDelta).toFixed(2)}`
+                    : "No strong price shift yet.",
+                mover.promotionSignals > 0
+                    ? `${mover.promotionSignals} live promotion signals recorded.`
+                    : "No live promotion cluster recorded.",
+                mover.stockSignals > 0
+                    ? `${mover.stockSignals} stock-pressure signals recorded.`
+                    : "No live stock-pressure signal recorded.",
+            ],
+            automationPosture: pressureScore >= 70 ? "Merchant review recommended" : "Advisory mode",
+            executionHint: pressureScore >= 70
+                ? "Prioritize this SKU in pricing review this week."
+                : "Continue analysis for this SKU until stronger live signals appear.",
+        };
+    })
+        .slice(0, 5);
     return {
-        ingested,
-        domains: domains.length,
-        products: sourceProducts.length,
+        summary: {
+            responseMode: overview.competitorState?.primaryState === "NO_MATCHES"
+                ? "No matched products yet"
+                : responsePlans.length === 0
+                    ? "No response needed"
+                    : responsePlans.some((plan) => plan.pressureScore >= 70)
+                        ? "Respond selectively"
+                        : "Hold and monitor",
+            topPressureCount: responsePlans.filter((plan) => plan.pressureScore >= 50).length,
+            automationReadiness: overview.competitorState?.primaryState === "NO_MATCHES"
+                ? "Response recommendations appear after VedaSuite finds comparable competitor products."
+                : responsePlans.length === 0
+                    ? "Matched competitor products are live, but no response action is needed right now."
+                    : "Competitor response suggestions are ready for merchant review.",
+        },
+        responsePlans,
     };
 }

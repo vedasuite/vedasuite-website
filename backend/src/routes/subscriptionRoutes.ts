@@ -1,24 +1,39 @@
 import { Router } from "express";
+import { requireCapability } from "../middleware/requireCapability";
 import {
+  buildCanonicalEntitlements,
   cancelSubscription,
   downgradeToTrial,
   getCurrentSubscription,
-  updateStarterModuleSelection,
+  resolveEntitlements,
+  resolveBillingState,
 } from "../services/subscriptionService";
+import { getBillingManagementState } from "../services/billingManagementService";
+import { resolveAuthenticatedShop } from "./routeShop";
 
 export const subscriptionRouter = Router();
+export const subscriptionDebugRouter = Router();
 
-subscriptionRouter.get("/plan", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+subscriptionRouter.get("/plan", requireCapability("billing.planManagement"), async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
   const plan = await getCurrentSubscription(shop);
-  return res.json({ subscription: plan });
+  const billingState = await resolveBillingState(shop);
+  const entitlements = buildCanonicalEntitlements({
+    planName: billingState.planName,
+    starterModule: billingState.starterModule,
+    accessActive: billingState.accessActive,
+    verified: billingState.verified,
+    trialActive: billingState.planName === "TRIAL" && billingState.accessActive,
+  });
+  const billing = await getBillingManagementState(shop).catch(() => null);
+  return res.json({ subscription: plan, billingState, entitlements, billing });
 });
 
-subscriptionRouter.post("/cancel", async (req, res) => {
-  const { shop } = req.body as { shop?: string };
+subscriptionRouter.post("/cancel", requireCapability("billing.downgrade"), async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
   if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
@@ -27,8 +42,8 @@ subscriptionRouter.post("/cancel", async (req, res) => {
   return res.json({ subscription });
 });
 
-subscriptionRouter.post("/downgrade-to-trial", async (req, res) => {
-  const { shop } = req.body as { shop?: string };
+subscriptionRouter.post("/downgrade-to-trial", requireCapability("billing.downgrade"), async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
   if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
@@ -37,17 +52,36 @@ subscriptionRouter.post("/downgrade-to-trial", async (req, res) => {
   return res.json({ result });
 });
 
-subscriptionRouter.post("/starter-module", async (req, res) => {
-  const { shop, starterModule } = req.body as {
-    shop?: string;
-    starterModule?: "fraud" | "competitor";
-  };
+subscriptionRouter.post("/starter-module", requireCapability("billing.moduleSelectionStarter"), async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
+    return res.status(400).json({ error: "Missing shop." });
+  }
+  return res.status(409).json({
+    error: {
+      code: "STARTER_MODULE_REQUIRES_BILLING_APPROVAL",
+      message:
+        "Changing the Starter feature now requires Shopify billing approval. Refresh billing and confirm the change there.",
+    },
+  });
+});
 
-  if (!shop || !starterModule) {
-    return res.status(400).json({ error: "Missing shop or starter module." });
+subscriptionDebugRouter.get("/entitlements", requireCapability("billing.planManagement"), async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
+    return res.status(400).json({ error: "Missing shop." });
   }
 
-  const subscription = await updateStarterModuleSelection(shop, starterModule);
-  return res.json({ subscription });
+  const billingState = await resolveBillingState(shop);
+  const entitlements = await resolveEntitlements(shop);
+
+  return res.json({
+    shop,
+    dbPlan: billingState.dbPlanName,
+    dbStarterModule: billingState.starterModule,
+    normalizedStarterModule: entitlements.starterModule,
+    enabledModules: entitlements.enabledModules,
+    lockedModules: entitlements.lockedModules,
+  });
 });
 

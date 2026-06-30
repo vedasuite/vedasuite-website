@@ -1,12 +1,46 @@
-import { createContext, ReactNode, useCallback, useEffect, useState } from "react";
-import { useApiClient } from "../api/client";
-import type { SubscriptionInfo } from "../hooks/useSubscriptionPlan";
-import { readModuleCache, writeModuleCache } from "../lib/moduleCache";
+import { createContext, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
+import type { BillingState, EntitlementState, SubscriptionInfo } from "../hooks/useSubscriptionPlan";
+import {
+  clearModuleCache,
+  readModuleCache,
+  writeModuleCache,
+} from "../lib/moduleCache";
+import { embeddedShopRequest } from "../lib/embeddedShopRequest";
+import {
+  fallbackSubscription,
+  normalizeBillingState,
+  normalizeEntitlementState,
+  normalizeStarterModule,
+  normalizeSubscriptionInfo,
+} from "../lib/billingCapabilities";
+import { useAppState } from "../hooks/useAppState";
+
+const SUBSCRIPTION_CACHE_KEY = "subscription-plan";
+const BILLING_CONFIRMATION_TIMEOUT_MS = 12000;
+const BILLING_CONFIRMATION_POLL_MS = 1000;
+
+export type BillingFlowState =
+  | "IDLE"
+  | "REDIRECTING_TO_SHOPIFY"
+  | "RETURNED_FROM_SHOPIFY"
+  | "CONFIRMING_BACKEND_STATE"
+  | "CONFIRMED"
+  | "FAILED";
 
 type SubscriptionContextValue = {
   subscription: SubscriptionInfo | null;
+  billingState: BillingState | null;
+  entitlements: EntitlementState | null;
   loading: boolean;
-  refresh: () => Promise<void>;
+  refresh: (options?: { clearCache?: boolean; syncAppState?: boolean }) => Promise<SubscriptionInfo>;
+  billingFlowState: BillingFlowState;
+  billingMessage: string | null;
+  billingError: string | null;
+  startBillingRedirect: () => void;
+  retryBillingConfirmation: () => Promise<void>;
+  dismissBillingMessage: () => void;
+  clearBillingError: () => void;
 };
 
 export const SubscriptionContext =
@@ -16,61 +50,335 @@ type Props = {
   children: ReactNode;
 };
 
-export function SubscriptionProvider({ children }: Props) {
-  const api = useApiClient();
-  const cachedSubscription = readModuleCache<SubscriptionInfo>("subscription-plan");
-  const [subscription, setSubscription] = useState<SubscriptionInfo | null>(
-    cachedSubscription ?? null
-  );
-  const [loading, setLoading] = useState(!cachedSubscription);
+function cleanupBillingQueryParams() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("billingResult");
+  url.searchParams.delete("billingMessage");
+  url.searchParams.delete("intentId");
+  url.searchParams.delete("plan");
+  url.searchParams.delete("starterModule");
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
 
-  const refresh = useCallback(async () => {
-    const res = await api.get<{ subscription: SubscriptionInfo }>(
-      "/api/subscription/plan"
+export function SubscriptionProvider({ children }: Props) {
+  const { refresh: refreshAppState } = useAppState();
+  const location = useLocation();
+  const initialCachedSubscription = useMemo(() => {
+    const rawCachedSubscription =
+      readModuleCache<SubscriptionInfo>(SUBSCRIPTION_CACHE_KEY);
+    return rawCachedSubscription
+      ? normalizeSubscriptionInfo(rawCachedSubscription)
+      : null;
+  }, []);
+  const billingParams = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    return {
+      billingResult: params.get("billingResult"),
+      expectedPlan: params.get("plan"),
+      expectedStarterModule: normalizeStarterModule(
+        params.get("starterModule")
+      ),
+      billingMessageFromUrl: params.get("billingMessage"),
+      intentId: params.get("intentId"),
+    };
+  }, [location.search]);
+
+  const [subscription, setSubscription] = useState<SubscriptionInfo | null>(
+    initialCachedSubscription ?? fallbackSubscription
+  );
+  const [billingState, setBillingState] = useState<BillingState | null>(null);
+  const [entitlements, setEntitlements] = useState<EntitlementState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [billingFlowState, setBillingFlowState] =
+    useState<BillingFlowState>("IDLE");
+  const [billingMessage, setBillingMessage] = useState<string | null>(null);
+  const [billingError, setBillingError] = useState<string | null>(null);
+
+  const commitSubscription = useCallback(
+    (nextSubscription: SubscriptionInfo, options?: { clearCache?: boolean }) => {
+      if (options?.clearCache) {
+        clearModuleCache(SUBSCRIPTION_CACHE_KEY);
+      }
+      setSubscription(nextSubscription);
+      writeModuleCache(SUBSCRIPTION_CACHE_KEY, nextSubscription);
+      return nextSubscription;
+    },
+    []
+  );
+
+  const fetchSubscription = useCallback(async () => {
+    const response = await embeddedShopRequest<{
+      subscription: SubscriptionInfo;
+      billingState?: BillingState | null;
+      entitlements?: EntitlementState | null;
+    }>(
+      "/api/subscription/plan",
+      { timeoutMs: 45000 }
     );
-    setSubscription(res.data.subscription);
-    writeModuleCache("subscription-plan", res.data.subscription);
-  }, [api]);
+    const nextSubscription = normalizeSubscriptionInfo(response.subscription);
+    setBillingState(normalizeBillingState(response.billingState));
+    setEntitlements(normalizeEntitlementState(response.entitlements));
+    return nextSubscription;
+  }, []);
+
+  const commitResolvedState = useCallback(
+    (payload: {
+      subscription?: SubscriptionInfo | null;
+      billingState?: BillingState | null;
+      entitlements?: EntitlementState | null;
+    }) => {
+      const nextSubscription = normalizeSubscriptionInfo(payload.subscription);
+      setBillingState(normalizeBillingState(payload.billingState));
+      setEntitlements(normalizeEntitlementState(payload.entitlements));
+      return commitSubscription(nextSubscription, { clearCache: true });
+    },
+    [commitSubscription]
+  );
+
+  const confirmBillingReturn = useCallback(async () => {
+    if (billingParams.billingResult !== "confirmed") {
+      return;
+    }
+
+    setLoading(true);
+    setBillingFlowState("RETURNED_FROM_SHOPIFY");
+    setBillingMessage(null);
+    setBillingError(null);
+    clearModuleCache(SUBSCRIPTION_CACHE_KEY);
+
+    try {
+      setBillingFlowState("CONFIRMING_BACKEND_STATE");
+
+      if (billingParams.intentId) {
+        const confirmation = await embeddedShopRequest<{
+          result?: unknown;
+          subscription?: SubscriptionInfo | null;
+          billingState?: BillingState | null;
+          entitlements?: EntitlementState | null;
+        }>("/api/billing/confirm-return", {
+          method: "POST",
+          body: {
+            intentId: billingParams.intentId,
+          },
+          timeoutMs: 45000,
+        });
+
+        if (confirmation.subscription) {
+          const confirmedSubscription = commitResolvedState(confirmation);
+          const planMatches =
+            !billingParams.expectedPlan ||
+            confirmedSubscription.planName === billingParams.expectedPlan;
+          const starterMatches =
+            billingParams.expectedPlan !== "STARTER" ||
+            !billingParams.expectedStarterModule ||
+            confirmedSubscription.starterModule ===
+              billingParams.expectedStarterModule;
+
+          if (planMatches && starterMatches) {
+            await refreshAppState({ silent: true }).catch(() => undefined);
+            setBillingFlowState("CONFIRMED");
+            setBillingMessage(
+              billingParams.billingMessageFromUrl ?? "Plan updated successfully"
+            );
+            cleanupBillingQueryParams();
+            return;
+          }
+        }
+      }
+
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < BILLING_CONFIRMATION_TIMEOUT_MS) {
+        const nextSubscription = await fetchSubscription();
+        const planMatches =
+          !billingParams.expectedPlan ||
+          nextSubscription.planName === billingParams.expectedPlan;
+        const starterMatches =
+          billingParams.expectedPlan !== "STARTER" ||
+          !billingParams.expectedStarterModule ||
+          nextSubscription.starterModule === billingParams.expectedStarterModule;
+
+        if (planMatches && starterMatches) {
+          commitSubscription(nextSubscription, { clearCache: true });
+          await refreshAppState({ silent: true }).catch(() => undefined);
+          setBillingFlowState("CONFIRMED");
+          setBillingMessage(
+            billingParams.billingMessageFromUrl ?? "Plan updated successfully"
+          );
+          cleanupBillingQueryParams();
+          return;
+        }
+
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, BILLING_CONFIRMATION_POLL_MS)
+        );
+      }
+
+      throw new Error(
+        "VedaSuite could not confirm the updated Shopify subscription in time."
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to load the current Shopify subscription.";
+
+      setBillingFlowState("FAILED");
+      setBillingError(message);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    billingParams.billingMessageFromUrl,
+    billingParams.billingResult,
+    billingParams.expectedPlan,
+    billingParams.expectedStarterModule,
+    billingParams.intentId,
+    commitResolvedState,
+    commitSubscription,
+    fetchSubscription,
+    refreshAppState,
+  ]);
+
+  const refresh = useCallback(
+    async (options?: { clearCache?: boolean; syncAppState?: boolean }) => {
+      const nextSubscription = await fetchSubscription();
+      if (options?.syncAppState) {
+        await refreshAppState({ silent: true }).catch(() => undefined);
+      }
+      return commitSubscription(nextSubscription, options);
+    },
+    [commitSubscription, fetchSubscription, refreshAppState]
+  );
+
+  const startBillingRedirect = useCallback(() => {
+    setBillingFlowState("REDIRECTING_TO_SHOPIFY");
+    setBillingError(null);
+    setBillingMessage(null);
+  }, []);
+
+  const retryBillingConfirmation = useCallback(async () => {
+    await confirmBillingReturn();
+  }, [confirmBillingReturn]);
+
+  const dismissBillingMessage = useCallback(() => {
+    setBillingMessage(null);
+    setBillingFlowState((current) => (current === "CONFIRMED" ? "IDLE" : current));
+  }, []);
+
+  const clearBillingError = useCallback(() => {
+    setBillingError(null);
+    setBillingFlowState((current) => (current === "FAILED" ? "IDLE" : current));
+  }, []);
 
   useEffect(() => {
     let mounted = true;
 
-    refresh()
-      .then(() => {
+    const hydrate = async () => {
+      try {
+        if (billingParams.billingResult === "confirmed") {
+          await confirmBillingReturn();
+          return;
+        }
+
+        const nextSubscription = await refresh();
         if (!mounted) return;
-      })
-      .catch(() => {
+
+        if (billingParams.billingResult === "noop") {
+          setBillingFlowState("CONFIRMED");
+          setBillingMessage(
+            billingParams.billingMessageFromUrl ?? "No plan change was required."
+          );
+          cleanupBillingQueryParams();
+          return;
+        }
+
+        if (billingParams.billingResult === "failed") {
+          setBillingFlowState("FAILED");
+          setBillingError(
+            billingParams.billingMessageFromUrl ??
+              "Shopify billing approval was not confirmed."
+          );
+          cleanupBillingQueryParams();
+          return;
+        }
+
+        setBillingFlowState((current) =>
+          current === "REDIRECTING_TO_SHOPIFY" ? current : "IDLE"
+        );
+        if (!nextSubscription) {
+          setBillingMessage(null);
+        }
+      } catch (error) {
         if (!mounted) return;
-        setSubscription(null);
-      })
-      .finally(() => {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unable to load the current Shopify subscription.";
+
+        if (!initialCachedSubscription) {
+          commitSubscription(fallbackSubscription, { clearCache: true });
+        }
+
+        setBillingFlowState(
+          billingParams.billingResult === "confirmed" ? "FAILED" : "IDLE"
+        );
+        setBillingError(message);
+        if (billingParams.billingResult && billingParams.billingResult !== "confirmed") {
+          cleanupBillingQueryParams();
+        }
+      } finally {
         if (!mounted) return;
         setLoading(false);
-      });
+      }
+    };
+
+    void hydrate();
 
     return () => {
       mounted = false;
     };
-  }, [refresh]);
+  }, [
+    billingParams.billingMessageFromUrl,
+    billingParams.billingResult,
+    confirmBillingReturn,
+    commitSubscription,
+    initialCachedSubscription,
+    refresh,
+  ]);
 
-  useEffect(() => {
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") {
-        refresh().catch(() => undefined);
-      }
-    };
-
-    window.addEventListener("focus", handleVisibility);
-    document.addEventListener("visibilitychange", handleVisibility);
-
-    return () => {
-      window.removeEventListener("focus", handleVisibility);
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
-  }, [refresh]);
+  const value = useMemo(
+    () => ({
+      subscription,
+      billingState,
+      entitlements,
+      loading,
+      refresh,
+      billingFlowState,
+      billingMessage,
+      billingError,
+      startBillingRedirect,
+      retryBillingConfirmation,
+      dismissBillingMessage,
+      clearBillingError,
+    }),
+    [
+      billingError,
+      billingState,
+      billingFlowState,
+      billingMessage,
+      clearBillingError,
+      dismissBillingMessage,
+      entitlements,
+      loading,
+      refresh,
+      retryBillingConfirmation,
+      startBillingRedirect,
+      subscription,
+    ]
+  );
 
   return (
-    <SubscriptionContext.Provider value={{ subscription, loading, refresh }}>
+    <SubscriptionContext.Provider value={value}>
       {children}
     </SubscriptionContext.Provider>
   );

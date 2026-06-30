@@ -10,7 +10,15 @@ import {
   Text,
 } from "@shopify/polaris";
 import { useEmbeddedNavigation } from "../hooks/useEmbeddedNavigation";
+import { useAppState } from "../hooks/useAppState";
 import { useSubscriptionPlan } from "../hooks/useSubscriptionPlan";
+import {
+  isBackendModuleEnabled,
+  resolveBackendPlan,
+  resolveBackendStarterModule,
+} from "../lib/backendModuleAccess";
+
+type FeatureKey = "fraud" | "competitor" | "pricing" | "profit";
 
 type Props = {
   title: string;
@@ -18,6 +26,7 @@ type Props = {
   requiredPlan: string;
   children: React.ReactNode;
   allowed: boolean;
+  featureKey?: FeatureKey;
 };
 
 export function ModuleGate({
@@ -26,16 +35,31 @@ export function ModuleGate({
   requiredPlan,
   children,
   allowed,
+  featureKey,
 }: Props) {
   const { navigateEmbedded } = useEmbeddedNavigation();
-  const { subscription } = useSubscriptionPlan();
+  const { subscription, billingState, entitlements } = useSubscriptionPlan();
+  const { appState } = useAppState();
 
-  if (allowed) {
+  const backendAllowed = featureKey
+    ? isBackendModuleEnabled(appState, featureKey)
+    : allowed;
+  const resolvedAllowed = featureKey ? backendAllowed : allowed;
+
+  if (resolvedAllowed) {
     return <>{children}</>;
   }
 
-  const currentPlan = subscription?.planName ?? "TRIAL";
-  const currentStarterModule = subscription?.starterModule;
+  const currentPlan =
+    resolveBackendPlan(appState) ?? entitlements?.planName ?? subscription?.planName ?? "NONE";
+  const currentStarterModule =
+    resolveBackendStarterModule(appState) ?? entitlements?.starterModule ?? null;
+  const starterLabel =
+    currentStarterModule === "fraud"
+      ? "Fraud Intelligence"
+      : currentStarterModule === "competitor"
+      ? "Competitor Intelligence"
+      : null;
 
   return (
     <Page title={title} subtitle={subtitle}>
@@ -43,8 +67,7 @@ export function ModuleGate({
         <Layout.Section>
           <Banner title={`Upgrade required: ${requiredPlan}`} tone="info">
             <p>
-              This module is part of a higher VedaSuite plan. Upgrade to unlock
-              the full experience for your store.
+              Upgrade to {requiredPlan} to unlock this workflow for your store.
             </p>
           </Banner>
         </Layout.Section>
@@ -53,26 +76,32 @@ export function ModuleGate({
             <BlockStack gap="300">
               <InlineStack align="space-between" blockAlign="center">
                 <Text as="h3" variant="headingMd">
-                  Module access is locked on your current plan
+                  This feature is not included in your current plan
                 </Text>
                 <Badge tone="attention">{currentPlan}</Badge>
               </InlineStack>
               <Text as="p" tone="subdued">
-                Move to the appropriate plan to enable this workflow and all of
-                its analytics, actions, and reports.
+                  {billingState?.lifecycle === "pending_approval"
+                  ? "A plan change is waiting for Shopify approval. Your current features stay available until Shopify confirms the change."
+                  : "Choose a plan that includes this workflow to use its analytics, actions, and reports."}
               </Text>
+              {billingState?.merchantDescription ? (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  {billingState.merchantDescription}
+                </Text>
+              ) : null}
               {currentPlan === "STARTER" && currentStarterModule ? (
-                <Banner title="Starter module selection detected" tone="info">
+                <Banner title="Current Starter feature" tone="info">
                   <p>
-                    Your store is currently using the{" "}
-                    <strong>{currentStarterModule}</strong> Starter module. Upgrade
-                    or switch the Starter module to access this workflow.
+                    Your store currently includes{" "}
+                    <strong>{starterLabel ?? currentStarterModule}</strong>. Upgrade
+                    or choose a different Starter feature to access this workflow.
                   </p>
                 </Banner>
               ) : null}
               <Button
                 variant="primary"
-                onClick={() => navigateEmbedded("/subscription")}
+                onClick={() => navigateEmbedded("/app/billing")}
               >
                 Manage subscription plans
               </Button>

@@ -1,23 +1,31 @@
 import { Router } from "express";
+import { requireFeature } from "../middleware/requireFeature";
 import {
   getProfitOpportunities,
   getProfitRecommendations,
 } from "../services/profitService";
+import { resolveAuthenticatedShop } from "./routeShop";
 
 export const profitRouter = Router();
 
-profitRouter.get("/recommendations", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+profitRouter.get(
+  "/recommendations",
+  requireFeature("profitOptimization"),
+  async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
   const recs = await getProfitRecommendations(shop);
   return res.json({ recommendations: recs });
 });
 
-profitRouter.get("/opportunities", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+profitRouter.get(
+  "/opportunities",
+  requireFeature("profitOptimization"),
+  async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
   const opportunities = await getProfitOpportunities(shop);

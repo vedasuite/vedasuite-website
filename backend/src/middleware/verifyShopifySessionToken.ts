@@ -1,16 +1,52 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import { env } from "../config/env";
+import {
+  buildReauthorizeUrl,
+  normalizeShopDomain,
+} from "../services/shopifyConnectionService";
+import {
+  clearShopifySessionCookie,
+  readShopifySessionCookie,
+} from "../lib/shopifySessionCookie";
+import { logEvent } from "../services/observabilityService";
 
-function buildReauthorizeUrl(shop?: string) {
-  if (!shop) {
-    return undefined;
+function sendAuthError(
+  req: Request,
+  res: Response,
+  status: number,
+  code:
+    | "MISSING_SHOP"
+    | "INVALID_SHOPIFY_SESSION_TOKEN"
+    | "SHOPIFY_AUTH_REQUIRED",
+  message: string,
+  shop?: string | null
+) {
+  const host =
+    typeof req.query.host === "string"
+      ? req.query.host
+      : typeof req.body?.host === "string"
+      ? req.body.host
+      : undefined;
+  const returnTo =
+    typeof req.query.returnTo === "string"
+      ? req.query.returnTo
+      : typeof req.body?.returnTo === "string"
+      ? req.body.returnTo
+      : req.path;
+
+  // Tell App Bridge to refresh the session token and retry automatically
+  if (status === 401) {
+    res.setHeader("X-Shopify-Retry-Invalid-Session-Request", "1");
   }
 
-  return new URL(
-    `/auth/install?shop=${encodeURIComponent(shop)}`,
-    env.shopifyAppUrl
-  ).toString();
+  return res.status(status).json({
+    error: {
+      code,
+      message,
+      reauthorizeUrl: buildReauthorizeUrl(shop, returnTo, host),
+    },
+  });
 }
 
 export function verifyShopifySessionToken(
@@ -18,19 +54,50 @@ export function verifyShopifySessionToken(
   res: Response,
   next: NextFunction
 ) {
-  const authHeader = req.headers.authorization;
-  const requestedShop =
+  const requestedShop = normalizeShopDomain(
     (typeof req.query.shop === "string" && req.query.shop) ||
-    (typeof req.body?.shop === "string" && req.body.shop) ||
-    undefined;
+      (typeof req.body?.shop === "string" && req.body.shop) ||
+      undefined
+  );
+  const cookieShop = normalizeShopDomain(readShopifySessionCookie(req));
+  const authHeader = req.headers.authorization;
+
+  if (!requestedShop && !cookieShop) {
+    return sendAuthError(
+      req,
+      res,
+      401,
+      "MISSING_SHOP",
+      "Missing Shopify shop context. Reopen the embedded app and retry."
+    );
+  }
+
+  const acceptCookieSession = () => {
+    if (!cookieShop) {
+      return false;
+    }
+
+    if (requestedShop && cookieShop !== requestedShop) {
+      return sendAuthError(
+        req,
+        res,
+        403,
+        "INVALID_SHOPIFY_SESSION_TOKEN",
+        "Shop parameter does not match the authenticated Shopify session.",
+        requestedShop
+      );
+    }
+
+    (req as Request & { shopifySession?: { shop?: string; sub?: string } }).shopifySession = {
+      shop: cookieShop,
+      sub: undefined,
+    };
+
+    return next();
+  };
 
   if (!authHeader?.startsWith("Bearer ")) {
-    return res.status(401).json({
-      error: {
-        message: "Missing Shopify session token. Reload the embedded app and try again.",
-        reauthorizeUrl: buildReauthorizeUrl(requestedShop),
-      },
-    });
+    return acceptCookieSession();
   }
 
   const token = authHeader.slice("Bearer ".length);
@@ -39,31 +106,68 @@ export function verifyShopifySessionToken(
     const payload = jwt.verify(token, env.shopifyApiSecret, {
       algorithms: ["HS256"],
       audience: env.shopifyApiKey,
-    }) as JwtPayload & { dest?: string };
+    }) as JwtPayload & { dest?: string; iss?: string };
 
-    const tokenShop =
-      typeof payload.dest === "string" ? new URL(payload.dest).host : undefined;
+    // Docs require iss and dest top-level domains to match
+    if (typeof payload.iss === "string" && typeof payload.dest === "string") {
+      try {
+        const issHost = new URL(payload.iss).host;
+        const destHost = new URL(payload.dest).host;
+        if (issHost !== destHost) {
+          throw new Error("iss/dest domain mismatch");
+        }
+      } catch {
+        return sendAuthError(
+          req,
+          res,
+          401,
+          "INVALID_SHOPIFY_SESSION_TOKEN",
+          "Invalid Shopify session token. Refresh or reconnect the embedded app and retry.",
+          requestedShop
+        );
+      }
+    }
+
+    const tokenShop = normalizeShopDomain(
+      typeof payload.dest === "string" ? new URL(payload.dest).host : undefined
+    );
 
     if (requestedShop && tokenShop && requestedShop !== tokenShop) {
-      return res.status(403).json({
-        error: {
-          message: "Shop parameter does not match the authenticated Shopify session.",
-        },
-      });
+      return sendAuthError(
+        req,
+        res,
+        403,
+        "INVALID_SHOPIFY_SESSION_TOKEN",
+        "Shop parameter does not match the authenticated Shopify session.",
+        requestedShop
+      );
     }
 
     (req as Request & { shopifySession?: { shop?: string; sub?: string } }).shopifySession = {
-      shop: tokenShop,
+      shop: tokenShop ?? requestedShop ?? cookieShop ?? undefined,
       sub: typeof payload.sub === "string" ? payload.sub : undefined,
     };
 
     return next();
-  } catch {
-    return res.status(401).json({
-      error: {
-        message: "Invalid Shopify session token. Reopen or reauthorize the embedded app and retry.",
-        reauthorizeUrl: buildReauthorizeUrl(requestedShop),
-      },
+  } catch (error) {
+    logEvent("warn", "shopify.session_token.invalid", {
+      shop: requestedShop ?? cookieShop ?? null,
+      route: req.originalUrl,
+      error,
     });
+
+    if (acceptCookieSession()) {
+      return;
+    }
+
+    clearShopifySessionCookie(res);
+    return sendAuthError(
+      req,
+      res,
+      401,
+      "INVALID_SHOPIFY_SESSION_TOKEN",
+      "Invalid Shopify session token. Refresh or reconnect the embedded app and retry.",
+      requestedShop
+    );
   }
 }

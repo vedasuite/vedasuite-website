@@ -8,8 +8,10 @@ export const env = {
   shopifyApiSecret: process.env.SHOPIFY_API_SECRET || "",
   shopifyScopes:
     process.env.SHOPIFY_SCOPES ||
-    "read_products,write_products,read_orders,write_orders,read_customers,write_own_subscription",
+    "read_products,read_orders,write_orders,read_customers",
   shopifyAppUrl: process.env.SHOPIFY_APP_URL || "",
+  shopifyAdminApiVersion:
+    process.env.SHOPIFY_ADMIN_API_VERSION || "2026-01",
   databaseUrl: process.env.DATABASE_URL || "",
   complianceExportDir:
     process.env.COMPLIANCE_EXPORT_DIR || "backend/runtime/compliance-exports",
@@ -32,7 +34,15 @@ export const env = {
     starterPrice: Number(process.env.BILLING_PLAN_STARTER_PRICE) || 19,
     growthPrice: Number(process.env.BILLING_PLAN_GROWTH_PRICE) || 49,
     proPrice: Number(process.env.BILLING_PLAN_PRO_PRICE) || 99,
+    testMode:
+      (process.env.SHOPIFY_BILLING_TEST_MODE || "true").toLowerCase() !==
+      "false",
   },
+  enableGuidedBootstrap:
+    (process.env.VEDASUITE_ENABLE_GUIDED_BOOTSTRAP || "false").toLowerCase() ===
+    "true",
+  enableGuidedSetupData:
+    (process.env.ENABLE_GUIDED_SETUP_DATA || "false").toLowerCase() === "true",
 };
 
 if (!env.shopifyApiKey || !env.shopifyApiSecret || !env.shopifyAppUrl) {

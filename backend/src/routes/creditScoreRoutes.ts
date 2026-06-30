@@ -1,25 +1,39 @@
 import { Router } from "express";
+import { requireFeature } from "../middleware/requireFeature";
 import {
   getCustomerScore,
+  getTrustOperatingLayer,
   listCustomerScores,
   recomputeCustomerScore,
 } from "../services/creditScoreService";
+import { resolveAuthenticatedShop } from "./routeShop";
 
 export const creditScoreRouter = Router();
+creditScoreRouter.use(requireFeature("creditScore"));
 
 creditScoreRouter.get("/customers", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop || typeof shop !== "string") {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
   const customers = await listCustomerScores(shop);
   return res.json({ customers });
 });
 
+creditScoreRouter.get("/operating-layer", async (req, res) => {
+  const shop = resolveAuthenticatedShop(req);
+  if (!shop) {
+    return res.status(400).json({ error: "Missing shop." });
+  }
+
+  const operatingLayer = await getTrustOperatingLayer(shop);
+  return res.json({ operatingLayer });
+});
+
 creditScoreRouter.get("/customer/:id", async (req, res) => {
-  const { shop } = req.query;
+  const shop = resolveAuthenticatedShop(req);
   const { id } = req.params;
-  if (!shop || typeof shop !== "string") {
+  if (!shop) {
     return res.status(400).json({ error: "Missing shop." });
   }
   const customer = await getCustomerScore(shop, id);

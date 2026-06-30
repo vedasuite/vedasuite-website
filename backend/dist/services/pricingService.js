@@ -4,7 +4,25 @@ exports.getPricingRecommendations = getPricingRecommendations;
 exports.simulatePricingChange = simulatePricingChange;
 exports.approvePricingRecommendation = approvePricingRecommendation;
 const prismaClient_1 = require("../db/prismaClient");
-const shopifyAdminService_1 = require("./shopifyAdminService");
+function parseRationaleJson(value) {
+    if (!value)
+        return {};
+    try {
+        return JSON.parse(value);
+    }
+    catch {
+        return {};
+    }
+}
+function deriveAutomationPosture(expectedProfitGain, expectedMarginDelta) {
+    if (expectedProfitGain >= 200 && expectedMarginDelta >= 6) {
+        return "Strong candidate for merchant review";
+    }
+    if (expectedProfitGain >= 100) {
+        return "Merchant review recommended";
+    }
+    return "Baseline estimate only";
+}
 async function getPricingRecommendations(shopDomain) {
     const store = await prismaClient_1.prisma.store.findUnique({
         where: { shop: shopDomain },
@@ -16,18 +34,62 @@ async function getPricingRecommendations(shopDomain) {
         orderBy: { createdAt: "desc" },
         take: 100,
     });
-    return history;
+    return history.map((row) => {
+        const rationale = parseRationaleJson(row.rationaleJson);
+        const demandScore = typeof rationale.demandScore === "number" ? rationale.demandScore : null;
+        const demandTrend = typeof rationale.demandTrend === "string"
+            ? rationale.demandTrend
+            : "insufficient history";
+        const demandSignals = Array.isArray(rationale.demandSignals)
+            ? rationale.demandSignals
+            : [
+                "This recommendation is currently a baseline estimate built from synced catalog pricing and merchant pricing settings.",
+                "Product-level demand history is still limited, so margin impact should be reviewed manually.",
+                "Use merchant approval before publishing price changes to Shopify.",
+            ];
+        const competitorPressure = typeof rationale.competitorPressure === "string"
+            ? rationale.competitorPressure
+            : "not_available";
+        const automationPosture = deriveAutomationPosture(row.expectedProfitGain ?? 0, row.expectedMarginDelta);
+        const evidenceSignals = Array.isArray(rationale.evidenceSignals)
+            ? rationale.evidenceSignals.filter((item) => typeof item === "string" && item.trim().length > 0)
+            : [];
+        const evidenceCount = Math.max(1, evidenceSignals.length);
+        return {
+            ...row,
+            demandScore,
+            demandTrend,
+            demandSignals,
+            evidenceSignals,
+            competitorPressure,
+            automationPosture,
+            approvalConfidence: Math.max(38, Math.min(78, Math.round(34 +
+                evidenceCount * 8 +
+                Math.min(10, Math.max(0, row.expectedMarginDelta) * 2) +
+                Math.min(10, Math.max(0, row.expectedProfitGain ?? 0) / 40)))),
+            autoApprovalCandidate: false,
+        };
+    });
 }
 async function simulatePricingChange(params) {
     const { currentPrice, recommendedPrice, salesVelocity, margin } = params;
     const priceDelta = recommendedPrice - currentPrice;
     const expectedMarginImprovement = margin === 0 ? 0 : (priceDelta / currentPrice) * margin;
     const projectedMonthlyProfitGain = priceDelta * salesVelocity * 30 * (margin / 100);
+    const demandScore = Math.max(0, Math.min(100, Math.round(salesVelocity * 4 + Math.max(0, 22 - Math.abs(priceDelta) * 3))));
     return {
         currentPrice,
         recommendedPrice,
         expectedMarginImprovement,
         projectedMonthlyProfitGain,
+        demandScore,
+        demandTrend: demandScore >= 72 ? "strong" : demandScore >= 50 ? "stable" : "softening",
+        automationPosture: deriveAutomationPosture(projectedMonthlyProfitGain, expectedMarginImprovement),
+        actionQueue: projectedMonthlyProfitGain >= 200
+            ? "High-priority merchant review"
+            : projectedMonthlyProfitGain >= 80
+                ? "Standard merchant review"
+                : "Baseline simulation only",
     };
 }
 async function approvePricingRecommendation(shopDomain, recommendationId) {
@@ -45,16 +107,8 @@ async function approvePricingRecommendation(shopDomain, recommendationId) {
     if (!recommendation) {
         throw new Error("Pricing recommendation not found");
     }
-    let rationale = {};
-    if (recommendation.rationaleJson) {
-        try {
-            rationale = JSON.parse(recommendation.rationaleJson);
-        }
-        catch {
-            rationale = {};
-        }
-    }
-    const shopifyPublishResult = await (0, shopifyAdminService_1.publishProductPrice)(shopDomain, recommendation.productHandle, recommendation.recommendedPrice);
+    const rationale = parseRationaleJson(recommendation.rationaleJson);
+    const automationPosture = deriveAutomationPosture(recommendation.expectedProfitGain ?? 0, recommendation.expectedMarginDelta);
     const updated = await prismaClient_1.prisma.priceHistory.update({
         where: { id: recommendation.id },
         data: {
@@ -62,13 +116,18 @@ async function approvePricingRecommendation(shopDomain, recommendationId) {
                 ...rationale,
                 status: "approved",
                 approvedAt: new Date().toISOString(),
-                publishedToShopify: shopifyPublishResult.updated,
-                shopifyPublishReason: shopifyPublishResult.updated ? null : shopifyPublishResult.reason,
+                publishedToShopify: false,
+                shopifyPublishReason: "Direct Shopify product writes are disabled in the current approval-safe configuration.",
+                automationPosture,
             }),
         },
     });
     return {
         ...updated,
-        shopifyPublishResult,
+        shopifyPublishResult: {
+            updated: false,
+            reason: "Direct Shopify price publishing is disabled. Review and apply product price changes manually in Shopify Admin if needed.",
+        },
+        automationPosture,
     };
 }
