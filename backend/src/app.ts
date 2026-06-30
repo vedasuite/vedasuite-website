@@ -67,8 +67,8 @@ export function createApp() {
             "https://admin.shopify.com",
             "https://*.myshopify.com",
           ],
-          scriptSrc: ["'self'", "'unsafe-inline'"],
-          styleSrc: ["'self'", "'unsafe-inline'"],
+          scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.shopify.com"],
+          styleSrc: ["'self'", "'unsafe-inline'", "https://cdn.shopify.com"],
         },
       },
     })
